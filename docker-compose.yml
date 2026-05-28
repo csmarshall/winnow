@@ -1,0 +1,34 @@
+# Winnow companion — runs alongside a stock Frigate container.
+#   sudo docker compose up -d --build
+#   open http://YOUR_FRIGATE_IP:8077
+#
+# Set your instance's real values in docker-compose.override.yml (gitignored) —
+# at minimum FRIGATE_URL, and WINNOW_NO_COMMIT=0 once you're ready to write back.
+# See docker-compose.override.yml.example.
+#
+# Host networking (Frigate runs network_mode: host, and Ollama listens on
+# localhost) — so Winnow reaches Frigate's API and Ollama on the host directly,
+# and serves its own UI on host port 8077.
+services:
+  winnow:
+    build: .
+    container_name: winnow
+    network_mode: host
+    environment:
+      # Browser-reachable Frigate address (LAN IP — image URLs are embedded for
+      # the reviewer's browser, so this must NOT be 127.0.0.1).
+      FRIGATE_URL: "http://YOUR_FRIGATE_IP:5000"
+      FRIGATE_API_PREFIX: "/api"
+      OLLAMA_HOST: "http://127.0.0.1:11434"
+      WINNOW_REFRESH_SEC: "1800"
+      WINNOW_MANUAL: "1"            # no-AI binary-sweep mode (no Ollama needed)
+      WINNOW_NO_COMMIT: "1"         # SAFE default: Commit is a dry-run (no writes).
+                                    # Set to "0" in docker-compose.override.yml to go live.
+      WINNOW_SNAPSHOT_TIMESTAMP: "0"  # Frigate's UTC timestamp overlay on snapshots; 1 to show
+      WINNOW_DEDUP: "1"               # 1 = one best frame/event (no dupes); 0 = every frame (shakedown)
+      # Auth (only for the 8971 HTTPS port; 5000/api needs none on a trusted LAN):
+      # FRIGATE_USER: "admin"
+      # FRIGATE_PASSWORD: "..."
+    volumes:
+      - ./review:/app/review        # persist candidates + verdicts on the host
+    restart: unless-stopped

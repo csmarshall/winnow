@@ -1,0 +1,14 @@
+# Copy to docker-compose.override.yml (gitignored) and set your own values.
+# docker compose auto-merges it on top of docker-compose.yml, so you never edit
+# the shared base file. At minimum set FRIGATE_URL to your Frigate host.
+services:
+  winnow:
+    environment:
+      # Your Frigate host's browser-reachable LAN IP (NOT 127.0.0.1 — image URLs
+      # are embedded for the reviewer's browser).
+      FRIGATE_URL: "http://192.168.1.50:5000"
+      # Start in dry-run; set "0" only when you're ready for Commit to write back
+      # to Frigate (categorize / classify / delete) and retrain.
+      WINNOW_NO_COMMIT: "1"
+      # FRIGATE_USER: "admin"          # only if your Frigate has auth on (port 8971)
+      # FRIGATE_PASSWORD: "..."

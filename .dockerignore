@@ -1,0 +1,11 @@
+.git
+review/
+snapshots/
+promote/
+tests/
+docs/
+deploy/
+*.log
+**/__pycache__/
+*.pyc
+.env

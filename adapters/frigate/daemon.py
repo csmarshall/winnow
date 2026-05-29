@@ -57,18 +57,28 @@ def refresh() -> str:
     return f"{res['count']} to review ({mode})"
 
 
-def commit_changes() -> str:
+def commit_changes(retrain: bool = True) -> str:
     """Commit hook — user-triggered. Push confirmed verdicts to Frigate, then
     rebuild so the committed (categorized) train files drop out of the pools and
-    only the leftovers + anything new remain. NO_COMMIT -> dry-run (no writes)."""
+    only the leftovers + anything new remain. NO_COMMIT -> dry-run (no writes).
+
+    `retrain`: default True (Charles's pick — consistent with normal commit). The
+    UI sends retrain=False for bulk library cleanup sessions so dozens of micro-
+    corrections don't trigger a retrain after every batch."""
     c = FrigateClient()
     c.login()
-    res = commit.run(apply=not NO_COMMIT, do_train=True, client=c)
+    res = commit.run(apply=not NO_COMMIT, do_train=retrain, client=c)
     build_candidates.build(client=c, manual=MANUAL)   # rebuild -> pools reflect commit
     if NO_COMMIT:
         return "dry-run (WINNOW_NO_COMMIT=1) — nothing written to Frigate"
-    return (f"pushed {res['categorized']} classifications + {res['faces']} faces, "
-            f"deleted {res['deleted']}; retrained {', '.join(res['trained']) or 'nothing'}")
+    parts = [f"pushed {res['categorized']} classifications + {res['faces']} faces",
+             f"deleted {res['deleted']}, pruned {res.get('train_deleted', 0)} redundant frames"]
+    if res.get("lib_reassigned") or res.get("lib_deleted"):
+        parts.append(f"library: {res.get('lib_reassigned', 0)} reassigned, "
+                     f"{res.get('lib_deleted', 0)} deleted")
+    parts.append(f"retrained {', '.join(res['trained']) or 'nothing'}"
+                 + ("" if retrain else " (retrain disabled)"))
+    return "; ".join(parts)
 
 
 if __name__ == "__main__":

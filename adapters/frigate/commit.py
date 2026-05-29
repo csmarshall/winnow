@@ -24,8 +24,16 @@ import argparse
 import json
 import os
 import time
+from collections import namedtuple
 
 from frigate_client import FrigateClient, FrigateError
+
+# Structured plan from plan_actions(). Named so future additions (more action
+# buckets) don't break callers — refer to fields by name, not position.
+Plan = namedtuple("Plan", [
+    "cands", "categorize", "face_classify", "deletes", "train_deletes",
+    "lib_face_moves", "lib_face_dels", "lib_data_moves", "lib_data_dels", "noop",
+])
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REVIEW = os.path.join(HERE, "..", "..", "review")
@@ -49,108 +57,233 @@ def _committed():
     return {d["cid"] for d in _load_jsonl(os.path.join(REVIEW, "committed.jsonl"))}
 
 
+# How many crops to KEEP per event (the rest are deleted from the train pool).
+# Diversity over volume — Frigate's "cap similar" guidance (ADR-0015 / Tenet 4).
+KEEP_PER_EVENT = max(1, int(os.environ.get("WINNOW_KEEP_PER_EVENT", "3")))
+
+
+def _capture_ts(f):
+    """Capture instant from a train filename <ts>-<rand>-<ts2>-<label>-<score>.ext."""
+    try:
+        return float(f.rsplit(".", 1)[0].split("-")[2])
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def _keep_subset(files, n=None):
+    """Up to n crops spread across the event's timeline — genuinely different frames
+    (car arriving / parked / leaving), not n near-identical best-angle shots. Evenly
+    spaced picks include the first and last. n defaults to KEEP_PER_EVENT."""
+    n = KEEP_PER_EVENT if n is None else n
+    files = sorted(files, key=_capture_ts)
+    if len(files) <= n:
+        return list(files)
+    if n == 1:
+        return [files[len(files) // 2]]
+    idx = sorted({round(i * (len(files) - 1) / (n - 1)) for i in range(n)})
+    return [files[i] for i in idx]
+
+
 def plan_actions():
+    """Return (cands, categorize, face_classify, deletes, train_deletes, noop).
+      categorize     -> [(cand, category, training_file)]  (one per kept crop)
+      train_deletes  -> [(cand, [files])]                   (redundant per-event siblings)
+      deletes        -> [cand]                              (rejected faces)
+    """
     cands = {c["cid"]: c for c in _load_jsonl(os.path.join(REVIEW, "candidates.jsonl"))}
     verdicts = _verdicts()
     committed = _committed()
-    categorize, face_classify, deletes, noop = [], [], [], []
+    categorize, face_classify, deletes, train_deletes, noop = [], [], [], [], []
+    # Library-cleanup buckets (ADR-0016): committed items the reviewer is curating.
+    # Different APIs from the train-pool path: face library uses face_reclassify
+    # (one-shot or register+delete) + delete_faces; dataset library uses
+    # reclassify (in-model move) + delete_dataset_images.
+    lib_face_moves: list = []      # (cand, new_name)
+    lib_face_dels: list = []       # cand
+    lib_data_moves: list = []      # (cand, new_category)
+    lib_data_dels: list = []       # cand
     for cid, verdict in verdicts.items():
         if cid in committed:
             continue
         c = cands.get(cid)
         if not c:
             continue
-        # "reject / not one of ours" (ADR-0014): delete the face from the source so
-        # it stops being re-suggested. (Faces only — classifier rejects fall to noop.)
-        if verdict == "reject":
-            if c["kind"] == "person" and c.get("face_train"):
-                deletes.append(c)
+        target = (verdict[len("assign:"):] if isinstance(verdict, str)
+                  and verdict.startswith("assign:") else None)
+        # ---- LIBRARY cleanup (ADR-0016) ------------------------------------
+        # Branch first so library candidates never fall through to the train-pool
+        # logic below (which would try to categorize a non-existent training_file).
+        if c.get("source") == "library_face":
+            if verdict == "reject":
+                lib_face_dels.append(c)
+            elif target is not None and target != c["identity"]:
+                lib_face_moves.append((c, target))
+            else:
+                noop.append(cid)         # yes/no/skip/self-assign = just a confirmation
+            continue
+        if c.get("source") == "library_dataset":
+            if verdict == "reject":
+                lib_data_dels.append(c)
+            elif target is not None and target != c["identity"]:
+                lib_data_moves.append((c, target))
             else:
                 noop.append(cid)
             continue
-        # "?" reassignment: verdict is "assign:<target>" — send the image to that
-        # subtype/person regardless of which pool it was reviewed in. A target that
-        # doesn't exist yet is created by Frigate on categorize/classify.
-        if isinstance(verdict, str) and verdict.startswith("assign:"):
-            target = verdict[len("assign:"):]
-            if c["kind"] == "person" and c.get("face_train"):
+        # "reject" (faces): delete the crop from the face library. Classifier reject -> noop.
+        if verdict == "reject":
+            (deletes if (c["kind"] == "person" and c.get("face_train")) else noop).append(
+                c if (c["kind"] == "person" and c.get("face_train")) else cid)
+            continue
+        # faces: classify the guessed name (yes) or the reassigned target
+        if c["kind"] == "person" and c.get("face_train"):
+            if target is not None:
                 face_classify.append((c, target))
-            elif c.get("model"):
-                categorize.append((c, target))
+            elif verdict == "yes":
+                face_classify.append((c, c["identity"]))
             else:
-                noop.append(cid)
-        elif c["kind"] == "person":
-            if verdict == "yes" and c.get("face_train"):
-                face_classify.append((c, c["identity"]))   # confirm guessed name
-            else:
-                noop.append(cid)             # 'no' = not this person; leave in pool
-        elif c.get("choices"):           # manual assignment: the verdict IS the subtype
-            if verdict in c["choices"]:
-                categorize.append((c, verdict))
-            else:
-                noop.append(cid)         # 'skip' / anything else
-        else:                            # classifier confirm (yes/no)
-            if verdict == "yes":
-                category = "none" if c.get("role") == "negative" else c["identity"]
-                categorize.append((c, category))
-            # a 'no' leaves the image (don't categorize); recorded so not re-shown.
-            else:
-                noop.append(cid)
-    return cands, categorize, face_classify, deletes, noop
+                noop.append(cid)             # 'no' = not this person; leave/park
+            continue
+        # classifiers: settle on the class this verdict commits to
+        if target is not None:
+            cls = target                      # reassigned (incl. 'none')
+        elif verdict == "yes":
+            cls = "none" if c.get("role") == "negative" else c["identity"]
+        elif c.get("choices") and verdict in c["choices"]:
+            cls = verdict                     # legacy N-way choices
+        else:
+            noop.append(cid)                  # 'no' / 'skip' / unknown -> leave it
+            continue
+        # EVENT-level (ADR-0015): keep a diverse subset as `cls`, delete the rest.
+        # Prefer the set computed at build time (what the reviewer SAW in the
+        # lightbox); fall back to recomputing if an older candidate lacks it.
+        if c.get("event_files") and c.get("model"):
+            keep = c.get("keep_files") or _keep_subset(c["event_files"])
+            for f in keep:
+                categorize.append((c, cls, f))
+            rest = [f for f in c["event_files"] if f not in keep]
+            if rest:
+                train_deletes.append((c, rest))
+        elif c.get("model"):                  # legacy per-crop classifier (e.g. AI mode)
+            categorize.append((c, cls, c["training_file"]))
+        else:
+            noop.append(cid)
+    return Plan(cands=cands, categorize=categorize, face_classify=face_classify,
+                deletes=deletes, train_deletes=train_deletes,
+                lib_face_moves=lib_face_moves, lib_face_dels=lib_face_dels,
+                lib_data_moves=lib_data_moves, lib_data_dels=lib_data_dels,
+                noop=noop)
 
 
 def run(apply=False, do_train=True, client=None):
-    cands, categorize, face_classify, deletes, noop = plan_actions()
+    p = plan_actions()
+    cands = p.cands; categorize = p.categorize; face_classify = p.face_classify
+    deletes = p.deletes; train_deletes = p.train_deletes
+    lib_face_moves = p.lib_face_moves; lib_face_dels = p.lib_face_dels
+    lib_data_moves = p.lib_data_moves; lib_data_dels = p.lib_data_dels
+    noop = p.noop
+    n_tdel_planned = sum(len(files) for _, files in train_deletes)
+    n_lib = (len(lib_face_moves) + len(lib_face_dels) + len(lib_data_moves) + len(lib_data_dels))
     print(f"plan: {len(categorize)} categorize, {len(face_classify)} face-assign, "
-          f"{len(deletes)} delete, {len(noop)} no-op")
-    for c, cat in categorize[:8]:
-        print(f"  categorize  {c['model']}/{cat:14} <- {c['training_file'][:40]}")
+          f"{len(deletes)} face-delete, {n_tdel_planned} redundant-frame delete, "
+          f"{n_lib} library cleanup ({len(lib_face_moves)+len(lib_data_moves)} reassign / "
+          f"{len(lib_face_dels)+len(lib_data_dels)} delete), {len(noop)} no-op")
+    for c, cat, tf in categorize[:8]:
+        print(f"  categorize  {c['model']}/{cat:14} <- {tf[:40]}")
     if len(categorize) > 8:
         print(f"  ... +{len(categorize)-8} more")
     for c, name in face_classify[:8]:
         print(f"  assign face {name} <- {c['face_train'][:40]}")
+    for c, files in train_deletes[:8]:
+        print(f"  prune {len(files)} redundant frames from {c['model']} "
+              f"(event {c.get('meta', {}).get('event', '?')})")
 
     if not apply:
         print("\n(dry run — re-run with --apply to execute)")
-        return {"categorized": 0, "faces": 0, "deleted": 0, "trained": []}
+        return {"categorized": 0, "faces": 0, "deleted": 0, "train_deleted": 0,
+                "lib_reassigned": 0, "lib_deleted": 0, "trained": []}
 
     c = client or FrigateClient()
     c.login()
+
+    # group every action by candidate so each event commits ATOMICALLY + idempotently:
+    # we only mark a cid committed if all of its categorize/delete/classify calls succeed.
+    from collections import defaultdict
+    plan = defaultdict(lambda: {"cand": None, "cat": [], "tdel": [],
+                                "face": None, "delface": False,
+                                "lib_move": None, "lib_del": False})
+    for cand, cat, tf in categorize:
+        plan[cand["cid"]]["cand"] = cand
+        plan[cand["cid"]]["cat"].append((cat, tf))
+    for cand, files in train_deletes:
+        plan[cand["cid"]]["cand"] = cand
+        plan[cand["cid"]]["tdel"] = files
+    for cand, name in face_classify:
+        plan[cand["cid"]]["cand"] = cand
+        plan[cand["cid"]]["face"] = name
+    for cand in deletes:
+        plan[cand["cid"]]["cand"] = cand
+        plan[cand["cid"]]["delface"] = True
+    # library cleanup (ADR-0016) — one move or one delete per cid
+    for cand, new_name in lib_face_moves + lib_data_moves:
+        plan[cand["cid"]]["cand"] = cand
+        plan[cand["cid"]]["lib_move"] = new_name
+    for cand in lib_face_dels + lib_data_dels:
+        plan[cand["cid"]]["cand"] = cand
+        plan[cand["cid"]]["lib_del"] = True
+
     done = open(os.path.join(REVIEW, "committed.jsonl"), "a")
     models = set()
-    n_cat = n_face = n_del = 0
-
-    for cand, category in categorize:
-        try:
-            c.categorize(cand["model"], category, cand["training_file"])
-            done.write(json.dumps({"cid": cand["cid"], "action": "categorize",
-                                   "model": cand["model"], "category": category,
-                                   "ts": time.time()}) + "\n")
-            done.flush()
+    n_cat = n_face = n_del = n_tdel = n_lib_move = n_lib_del = 0
+    for cid, p in plan.items():
+        cand, ok = p["cand"], True
+        for cat, tf in p["cat"]:
+            try:
+                c.categorize(cand["model"], cat, tf); n_cat += 1
+            except FrigateError as e:
+                print(f"  ! categorize failed {cid}: {e}"); ok = False
+        if p["tdel"]:
+            try:
+                c.delete_train(cand["model"], p["tdel"]); n_tdel += len(p["tdel"])
+            except FrigateError as e:
+                print(f"  ! prune failed {cid}: {e}"); ok = False
+        if p["face"]:
+            try:
+                c.classify_face_train(p["face"], cand["face_train"]); n_face += 1
+            except FrigateError as e:
+                print(f"  ! face assign failed {cid}: {e}"); ok = False
+        if p["delface"]:
+            try:
+                c.delete_faces("train", [cand["face_train"]]); n_del += 1
+            except FrigateError as e:
+                print(f"  ! face delete failed {cid}: {e}"); ok = False
+        # ---- LIBRARY cleanup (ADR-0016): move or delete in the COMMITTED pools ----
+        if p["lib_move"]:
+            try:
+                if cand.get("source") == "library_face":
+                    # adaptive: one-shot reclassify on v0.18+, register+delete on v0.17
+                    c.face_reclassify(cand["face_lib_name"], cand["library_id"], p["lib_move"])
+                else:                                  # library_dataset
+                    c.reclassify(cand["model"], cand["library_category"],
+                                 cand["library_id"], p["lib_move"])
+                    models.add(cand["model"])           # retrain the affected classifier
+                n_lib_move += 1
+            except (FrigateError, Exception) as e:
+                print(f"  ! library reassign failed {cid}: {e}"); ok = False
+        if p["lib_del"]:
+            try:
+                if cand.get("source") == "library_face":
+                    c.delete_faces(cand["face_lib_name"], [cand["library_id"]])
+                else:                                  # library_dataset
+                    c.delete_dataset_images(cand["model"], cand["library_category"],
+                                            [cand["library_id"]])
+                    models.add(cand["model"])
+                n_lib_del += 1
+            except (FrigateError, Exception) as e:
+                print(f"  ! library delete failed {cid}: {e}"); ok = False
+        if cand.get("model"):
             models.add(cand["model"])
-            n_cat += 1
-        except FrigateError as e:
-            print(f"  ! categorize failed for {cand['cid']}: {e}")
-
-    for cand, name in face_classify:
-        try:
-            c.classify_face_train(name, cand["face_train"])
-            done.write(json.dumps({"cid": cand["cid"], "action": "face_classify",
-                                   "name": name, "ts": time.time()}) + "\n")
-            done.flush()
-            n_face += 1
-        except FrigateError as e:
-            print(f"  ! face assign failed for {cand['cid']}: {e}")
-
-    for cand in deletes:
-        try:
-            c.delete_faces("train", [cand["face_train"]])   # remove the rejected face
-            done.write(json.dumps({"cid": cand["cid"], "action": "delete_face",
-                                   "file": cand["face_train"], "ts": time.time()}) + "\n")
-            done.flush()
-            n_del += 1
-        except FrigateError as e:
-            print(f"  ! delete failed for {cand['cid']}: {e}")
+        if ok:
+            done.write(json.dumps({"cid": cid, "ts": time.time()}) + "\n"); done.flush()
 
     for cid in noop:
         done.write(json.dumps({"cid": cid, "action": "noop", "ts": time.time()}) + "\n")
@@ -160,15 +293,16 @@ def run(apply=False, do_train=True, client=None):
     if do_train and models:
         for m in sorted(models):
             try:
-                c.train(m)
-                trained.append(m)
-                print(f"  triggered retrain: {m}")
+                c.train(m); trained.append(m); print(f"  triggered retrain: {m}")
             except FrigateError as e:
                 print(f"  ! train failed for {m}: {e}")
 
-    print(f"\ncommitted: {n_cat} categorized, {n_face} faces assigned, "
-          f"{n_del} deleted, retrained {trained or 'nothing'}")
-    return {"categorized": n_cat, "faces": n_face, "deleted": n_del, "trained": trained}
+    print(f"\ncommitted: {n_cat} categorized, {n_face} faces assigned, {n_del} faces "
+          f"deleted, {n_tdel} redundant frames pruned, {n_lib_move} library reassigned, "
+          f"{n_lib_del} library deleted, retrained {trained or 'nothing'}")
+    return {"categorized": n_cat, "faces": n_face, "deleted": n_del,
+            "train_deleted": n_tdel, "lib_reassigned": n_lib_move,
+            "lib_deleted": n_lib_del, "trained": trained}
 
 
 def main() -> int:

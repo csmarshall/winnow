@@ -4,8 +4,8 @@
 - **Date:** 2026-05-22
 
 ## Context
-First attempts asked the VLM to identify entities directly ("is this the DeLorean
-DeLorean?", "is this Scooby?"). This failed in two distinct ways observed on real
+First attempts asked the VLM to identify entities directly ("is this the DeLorean?",
+"is this Scooby?"). This failed in two distinct ways observed on real
 data:
 - **Brand/identity hedging:** asked to name a *make/model*, the model refused to
   commit from a security cam ("can't read the badge") and returned `unsure` even

@@ -29,3 +29,5 @@ Format: [`_template.md`](_template.md). Status ∈ Proposed | Accepted | Superse
 | [0012](0012-source-agnostic-core-frigate-first.md) | Source-agnostic core, Frigate-first reality (adapter contract) | Accepted |
 | [0013](0013-user-triggered-commit.md) | Commit is user-triggered, not automatic | Accepted |
 | [0014](0014-verdict-model-reassign-first-class.md) | Verdict model: reassign first-class, "no" is unresolved, reject deletes | Accepted |
+| [0015](0015-event-level-review-and-keepset.md) | Event-level review: one card per event, keep a capped diverse set, prune the rest | Accepted |
+| [0016](0016-library-curation.md) | Library curation: surface already-committed items for review (the "Luigi → Mario" gap) | Accepted |

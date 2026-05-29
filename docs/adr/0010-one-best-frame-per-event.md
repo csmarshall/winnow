@@ -2,6 +2,8 @@
 
 - **Status:** Accepted
 - **Date:** 2026-05-27
+- **Refined by:** ADR-0015 (keep a small *diverse set* per event, not strictly one; and
+  prune the rest from the train pool, not just dedup the review queue)
 
 ## Context
 Frigate emits many near-identical crops during a *single* tracked-object event

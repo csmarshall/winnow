@@ -54,15 +54,22 @@ knowledge. There's no separate "pull / classify / promote" dance; a **refresh**
 3. **Rebuild** the review queue from Frigate's current data.
 
 Two modes:
-- **Manual (no-AI):** every candidate enters a binary "Is this *X*?" sweep per
-  subtype. No priming needed — just open and sort
-  ([ADR-0008](docs/adr/0008-binary-sweep-manual-mode.md)).
+- **Manual (no-AI):** one review card per Frigate *event* — "Is this *X*?" (X = the
+  best frame's guess) — confirmed, reassigned, or skipped. Deciding an event keeps a
+  small diverse set of its frames for training and prunes the near-duplicate rest
+  ([ADR-0008](docs/adr/0008-binary-sweep-manual-mode.md),
+  [ADR-0015](docs/adr/0015-event-level-review-and-keepset.md)).
 - **AI pre-sort:** a local VLM (Qwen2.5-VL via Ollama) proposes a label first, so
   most swipes are a one-tap confirm.
+- **Library cleanup:** review what Frigate has *already committed* (the face
+  library + classifier datasets) and fix the high-confidence mis-matches that
+  bypassed the train pool — same swipe loop, same keys, no need to leave Winnow
+  ([ADR-0016](docs/adr/0016-library-curation.md)).
 
 The swipe UI:
-- An **inverted-T button cross** (✗ No / Skip / ✓ Yes + Undo) that mirrors the
-  arrow keys (and WASD); tap an image for the **full scene with Frigate's box**.
+- A **5-way button cross** (✗ No · 🏷 Reassign · ✓ Yes · Skip · Undo/Back) that
+  mirrors the arrow keys (and WASD); tap an image for the **full scene with Frigate's
+  box** (and, for an event card, a filmstrip of the frames that will be trained).
 - A **"?" reassign** typeahead — when the yes/no doesn't fit, reassign to another
   subtype or create a new one, keyboard-navigable and case-insensitive
   ([ADR-0011](docs/adr/0011-reassign-and-subtype-creation.md)).
@@ -157,7 +164,9 @@ Winnow ships as a Docker container ([ADR-0007](docs/adr/0007-always-ready-daemon
 From the project root:
 
 ```bash
-# set FRIGATE_URL in docker-compose.yml to your browser-reachable Frigate (LAN IP)
+# copy the override template and set your values (gitignored — never edit the base file):
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#   then set FRIGATE_URL (browser-reachable LAN IP) and, when ready, WINNOW_NO_COMMIT: "0"
 sudo docker compose up -d --build
 ```
 
@@ -191,7 +200,7 @@ only in your Frigate instance, never in this repo.)
 
 ## Testing
 
-- **39 stdlib unit tests** (`python3 -m unittest discover -s tests`) — a
+- **61 stdlib unit tests** (`python3 -m unittest discover -s tests`) — a
   `FakeClient` stands in for Frigate, so nothing touches the network or Ollama.
 - **Dev-only browser smoke suite** ([`tests/e2e/`](tests/e2e/)) — Playwright
   coverage of the critical UI paths (reassign, voting, flagging). *Not* a runtime
@@ -217,6 +226,20 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md). Highlights:
 
 The principles behind it are distilled in [`docs/TENETS.md`](docs/TENETS.md);
 the full decisions are recorded as [ADRs](docs/adr/).
+
+## Frigate references — the best practices Winnow follows
+
+Winnow optimizes Frigate the way Frigate asks to be optimized; the relevant docs:
+
+- [Custom classification](https://docs.frigate.video/configuration/custom_classification/) ·
+  [Object classification](https://docs.frigate.video/configuration/custom_classification/object_classification)
+  — train from the **Recent Classifications** tab, *"gather balanced examples across
+  times of day, weather, and distances"*, *"keep classes visually distinct"*, and the
+  auto-`none` hard-negative bucket. (Winnow's event-level keep-set, ADR-0015, exists to
+  honor "balanced/diverse, not near-duplicate volume".)
+- [Face recognition](https://docs.frigate.video/configuration/face_recognition) —
+  identity by face embedding with *"different poses, lighting, and expressions"*; no face
+  negatives (Winnow's `reject` deletes rather than trains a negative — ADR-0014).
 
 ---
 

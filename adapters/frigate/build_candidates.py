@@ -19,6 +19,7 @@ import os
 import re
 
 from frigate_client import FrigateClient
+from commit import _keep_subset   # the per-event keep-set selector (ADR-0015)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REVIEW = os.path.join(HERE, "..", "..", "review")
@@ -213,34 +214,46 @@ def _attach_face_frame(client, eid, face_ts, evcache, rec):
 
 
 def from_model_manual(client, model, cfg):
-    """No VLM pre-sort (fresh-user mode, per ADR-0008). Mirrors the face flow so the
-    SWIPE interface is identical across types: each train crop is shown ONCE, in the
-    pool of Frigate's own guessed class — "Is this <guess>?" — confirmed with Yes,
-    corrected via Reassign (the model's other classes + none), or left with No.
-    (It used to enter EVERY class pool as a separate yes/no, so the same crop showed
-    up N times.) Guess + score are parsed from the train filename, exactly like faces.
-    A BINARY model (1 class) just asks "Is this <class>?" (nothing to reassign to)."""
+    """One review card per EVENT (ADR-0015 / Tenet 4). Frigate saves many near-
+    identical crops per tracked object; we group the train pool by Frigate's event id
+    and present ONE card — the single best (highest-confidence) crop — as "Is this
+    <guess>?" (guess = that best crop's label). Deciding the event applies to the
+    WHOLE event at commit: a small diverse subset (WINNOW_KEEP_PER_EVENT) is
+    categorized to the chosen class and the rest are deleted from the train pool — so
+    a parked car is one card, not 19, and training stays diverse (no near-dup overfit,
+    Frigate's "cap similar" guidance). Each candidate carries `event_files` (all the
+    event's crops) for commit to act on. A binary model still works (its event guess
+    is just its one class). Swipe UI is identical to faces: Yes / Reassign / No / Skip."""
     out, evcache = [], {}
     files = [f for f in client.list_train(model) if _real_event(f)]
-    files = _best_by_event(files) if DEDUP else sorted(files)  # best frame/event
     ids = list(cfg["identities"])
+    events: dict = {}
     for f in files:
-        parts = f.rsplit(".", 1)[0].split("-")
-        # multi-class -> pool by Frigate's guess; binary -> the one class
+        events.setdefault(train_event_id(f), []).append(f)
+    for eid, group in events.items():
+        rep = max(group, key=_score_of)            # best crop = the representative shown
+        parts = rep.rsplit(".", 1)[0].split("-")
         guess = parts[-2] if (len(ids) > 1 and len(parts) >= 2) else ids[0]
-        try:
-            conf = float(parts[-1])
-        except (ValueError, IndexError):
-            conf = None
+        evfiles = sorted(group)
+        keep = _keep_subset(evfiles)               # the diverse subset that will be TRAINED
+        n = len(evfiles)
         rec = {
-            "cid": f"{model}|{f}",                 # ONE candidate per crop
+            "cid": f"{model}|{eid}",               # ONE candidate per EVENT
             "kind": cfg["kind"], "identity": guess, "role": "positive",
-            "model": model, "training_file": f,
-            "img": os.path.join(CLIPS_DISK, model, "train", f),
-            "img_url": client.train_image_url(model, f),
-            "confidence": conf, "reason": "Frigate's guess", "source": "manual", "meta": {},
+            "model": model, "training_file": rep,  # representative crop
+            "event_files": evfiles,                # all crops in the event
+            "keep_files": keep,                    # the ones commit keeps; rest are pruned
+            # browser URLs for the keep-set, so the lightbox can show exactly what
+            # will be trained (hand-validate they're the same entity) — ADR-0015.
+            "keep_urls": [client.train_image_url(model, f) for f in keep],
+            "img": os.path.join(CLIPS_DISK, model, "train", rep),
+            "img_url": client.train_image_url(model, rep),
+            "confidence": _score_of(rep),
+            "reason": f"Frigate's guess — {n} frame{'s' if n != 1 else ''} in this event"
+                      + (f", keeping {len(keep)}" if n > len(keep) else ""),
+            "source": "manual", "meta": {"event": eid, "frames": n},
         }
-        _attach_media(client, train_event_id(f), evcache, rec)
+        _attach_media(client, eid, evcache, rec)
         out.append(rec)
     return out
 
@@ -342,6 +355,79 @@ def from_faces(client):
     return out
 
 
+# ---- LIBRARY (already-committed crops) sources, ADR-0016 -------------------
+# These surface what Frigate's auto-commit (face recognition above threshold, or
+# direct UI categorize) already moved into its committed pools, so the reviewer
+# can correct wrong matches that NEVER passed through the train pool (the
+# Luigi->Mario class of bug). Same swipe UI; different data source: `bucket =
+# "library"` separates them on the home page. Yes = a no-op confirmation tracked
+# in verdicts so the item doesn't reappear; Reassign / Reject go through the
+# library APIs at commit time (see commit.plan_actions).
+LIBRARY = os.environ.get("WINNOW_LIBRARY_REVIEW", "1").lower() in ("1", "true", "yes")
+LIBRARY_BUCKET = "library"
+
+
+def from_face_library(client) -> list[dict]:
+    """One candidate per file in each person's COMMITTED face folder
+    (`/clips/faces/<Name>/<file>`), asking "Is this <Name>?". The library is
+    returned by /api/faces; we skip the special 'train' pool (handled by
+    from_faces). Reassign uses client.face_reclassify (adaptive: one-shot on
+    v0.18, register+delete on v0.17 — same end result either way)."""
+    out: list[dict] = []
+    try:
+        faces = client.list_faces() or {}
+    except Exception as e:
+        print(f"  (skipping face library: {e})")
+        return out
+    for name, files in faces.items():
+        if name in FACE_SKIP or not isinstance(files, list):
+            continue
+        for f in files:
+            out.append({
+                "cid": f"face_lib|{name}|{f}",
+                "kind": "person", "identity": name,
+                "bucket": LIBRARY_BUCKET, "role": "positive",
+                "face_lib_name": name, "library_id": f,        # commit needs both
+                "img": os.path.join(CLIPS_DISK, "faces", name, f),
+                "img_url": client.media_url(f"faces/{name}/{f}"),
+                "confidence": None,
+                "reason": f"Already in {name}'s library — verify",
+                "source": "library_face", "meta": {},
+            })
+    return out
+
+
+def from_dataset_library(client, model: str, cfg: dict) -> list[dict]:
+    """One candidate per file in each category of a classifier's committed
+    dataset (`/clips/<model>/dataset/<category>/<file>`), asking
+    "Is this <category>?". Reassign uses client.reclassify (in-model move),
+    Reject uses client.delete_dataset_images. `none` is included so hard-
+    negatives can also be reviewed/corrected."""
+    out: list[dict] = []
+    try:
+        ds = client.get_dataset(model) or {}
+        cats = ds.get("categories") or {}
+    except Exception as e:
+        print(f"  (skipping dataset library for {model}: {e})")
+        return out
+    for cat, files in cats.items():
+        if not isinstance(files, list):
+            continue
+        for f in files:
+            out.append({
+                "cid": f"{model}_lib|{cat}|{f}",
+                "kind": cfg["kind"], "identity": cat,
+                "bucket": LIBRARY_BUCKET, "role": "positive",
+                "model": model, "library_category": cat, "library_id": f,
+                "img": os.path.join(CLIPS_DISK, model, "dataset", cat, f),
+                "img_url": client.media_url(f"{model}/dataset/{cat}/{f}"),
+                "confidence": None,
+                "reason": f"Already in {model}/{cat} — verify",
+                "source": "library_dataset", "meta": {},
+            })
+    return out
+
+
 def build(client=None, manual=None) -> dict:
     """Regenerate review/candidates.jsonl. manual=True (or env WINNOW_MANUAL)
     skips the VLM pre-sort and presents the raw train pool to be assigned by
@@ -357,6 +443,15 @@ def build(client=None, manual=None) -> dict:
         cands += (from_model_manual(c, model, cfg) if manual
                   else from_model(c, model, cfg))
     cands += from_faces(c)
+    # Library-cleanup pools (ADR-0016): surface ALREADY-committed items so the
+    # reviewer can fix wrong matches that bypassed the train-pool review path
+    # (e.g. a Luigi face auto-committed to Mario above recognition_threshold).
+    # Each library candidate gets bucket="library" so the home page shows them
+    # in a distinct section. Filtered out client-side if WINNOW_LIBRARY_REVIEW=0.
+    if LIBRARY:
+        cands += from_face_library(c)
+        for model, cfg in models.items():
+            cands += from_dataset_library(c, model, cfg)
 
     os.makedirs(REVIEW, exist_ok=True)
     out = os.path.join(REVIEW, "candidates.jsonl")

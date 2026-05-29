@@ -11,3 +11,6 @@ docker-compose.override.yml
 # Python
 __pycache__/
 *.pyc
+
+# Eval harness venv (dev-only; recreated from eval/README.md)
+eval/.venv/

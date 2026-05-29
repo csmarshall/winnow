@@ -21,8 +21,10 @@ Docker container with `restart: unless-stopped`). The source-agnostic core expos
 - **on demand** via a "Check for new" button shown when the reviewer is caught up.
 
 The home page summarizes "**X pools across Y types**" with per-pool progress and a
-freshness footer ("refreshed N min ago"). Committing is **automatic** (part of
-refresh) so the reviewer never touches Frigate.
+freshness footer ("refreshed N min ago"). Committing was originally **automatic**
+(part of refresh) so the reviewer never touches Frigate — **superseded by ADR-0013**:
+commit is now an explicit, user-triggered batch, never an automatic side-effect of
+refresh.
 
 Per-reviewer **"where am I" position is a short-TTL (~1h) client cookie**, not
 server state: the durable decisions live in `verdicts.jsonl` (server), while the

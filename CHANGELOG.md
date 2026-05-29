@@ -24,8 +24,12 @@ Initial public release.
   them (categorize / classify / delete) and retrains the affected models.
 - **Full-scene context** — the exact face-capture frame for faces, with a camera-probe
   fallback that recovers the scene even when a tracked event has aged out.
-- **One-frame-per-event dedup**, low-confidence-first ordering, and a dry-run mode
-  (`WINNOW_NO_COMMIT=1`) for safe shakedowns.
-- Docs: ADRs 0001–0014, `docs/TENETS.md`, `docs/flows.md`, `docs/SETUP.md`.
+- **Event-level review** (ADR-0015) — one card per Frigate event; on commit, a capped
+  diverse keep-set (`WINNOW_KEEP_PER_EVENT`, default 3) is trained and the redundant
+  near-duplicate frames are pruned. The lightbox shows the keep-set filmstrip to verify
+  the frames are the same entity before confirming.
+- **Low-confidence-first** ordering and a dry-run mode (`WINNOW_NO_COMMIT=1`) for safe
+  shakedowns.
+- Docs: ADRs 0001–0015, `docs/TENETS.md`, `docs/flows.md`, `docs/SETUP.md`.
 
 [0.1.0]: https://github.com/csmarshall/winnow/releases/tag/v0.1.0

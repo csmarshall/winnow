@@ -3,6 +3,14 @@
 - **Status:** Accepted
 - **Date:** 2026-05-27
 
+> **Implementation update (ADR-0015):** the dog/car **reshuffle** below was originally
+> two verdicts (`no` on the source sibling + `yes` on the target sibling). Now that
+> manual mode is **event-level** (one candidate per event, no sibling pools), a reassign
+> is a **single `assign:<target>`** verdict and `identities()` does the pool accounting
+> (source shows *moved*, target shows *allocated*). The **Unresolved** bucket for face
+> "no" is **not yet implemented** — a face "no" currently no-ops (parks in place); it's
+> tracked in [ROADMAP](../ROADMAP.md).
+
 ## Context
 Verdicts began as yes / no / skip, with reassignment bolted on later as a secondary
 "?" escape hatch. In use, **"no" is a dead end that loses signal** — most starkly

@@ -181,6 +181,14 @@ class FrigateClient:
         return self.request("POST", f"/classification/{_seg(model)}/dataset/categorize",
                             {"category": category, "training_file": training_file})
 
+    def delete_train(self, model, training_files):
+        """Delete crops from a model's train pool (e.g. the redundant per-event
+        siblings after keeping a diverse few — ADR-0015). No-op on empty list."""
+        if not training_files:
+            return None
+        return self.request("POST", f"/classification/{_seg(model)}/train/delete",
+                            {"ids": list(training_files)})
+
     def reclassify(self, model, category, image_id, new_category):
         return self.request("POST",
                             f"/classification/{_seg(model)}/dataset/{_seg(category)}/reclassify",
@@ -251,6 +259,63 @@ class FrigateClient:
         """Assign an unclassified train-pool face crop to a name (like categorize)."""
         return self.request("POST", f"/faces/train/{name}/classify",
                             {"training_file": training_file})
+
+    # ---- face LIBRARY ops (already-committed crops, ADR-0016) ---------------
+    # v0.17 has /faces/{name}/register (upload a file) and /faces/{name}/delete
+    # but NOT /faces/{name}/reclassify (move from person A to person B in one
+    # call). The move endpoint lands in dev (v0.18+). We probe once at runtime
+    # and use the one-shot move when available; otherwise we do register-to-new
+    # then delete-from-old (same end result, ~2x the API work, works today).
+    def _has_face_reclassify(self) -> bool:
+        if not hasattr(self, "_face_reclassify_cached"):
+            # OPTIONS isn't supported, so probe with a known-name + bogus body.
+            # 422 (body validation) = endpoint exists; 404 = it doesn't.
+            # An empty `name` would 404 against a real route too, so use the
+            # first face library name we can find. Falls back to False on error.
+            try:
+                names = [n for n in (self.list_faces() or {}) if n != "train"]
+                name = names[0] if names else "Charles"   # any name; we only read status
+                code = self._status(f"{self._ensure_prefix()}/faces/{_seg(name)}/reclassify",
+                                    method="POST")
+                self._face_reclassify_cached = code is not None and code != 404
+            except Exception:
+                self._face_reclassify_cached = False
+        return self._face_reclassify_cached
+
+    def face_register(self, name: str, file_bytes: bytes, filename: str = "face.webp"):
+        """Upload `file_bytes` directly into the `<name>` face library — Frigate
+        re-embeds and stores it. The v0.17 path used for Winnow's library
+        reassign (paired with delete_faces on the old name)."""
+        # Multipart form with `file=<bytes>`. urllib doesn't ship a multipart
+        # builder, so we hand-build the body (no extra dep).
+        boundary = "----winnowFaceUpload" + str(os.getpid())
+        body = (f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                f"Content-Type: image/webp\r\n\r\n").encode()
+        body += file_bytes + f"\r\n--{boundary}--\r\n".encode()
+        full = self._ensure_prefix() + f"/faces/{_seg(name)}/register"
+        req = urllib.request.Request(self.base + full, data=body, method="POST")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        if self._token:
+            req.add_header("Authorization", f"Bearer {self._token}")
+        resp = self._opener.open(req, timeout=30)
+        return json.loads(resp.read().decode() or "null")
+
+    def face_reclassify(self, old_name: str, image_id: str, new_name: str):
+        """Move a face from <old_name>'s library to <new_name>'s. Adaptive:
+        uses Frigate's one-shot /faces/{name}/reclassify when available
+        (v0.18+), otherwise falls back to register-then-delete (v0.17). Same
+        outward semantics either way; safe order (register-first) so a
+        partial failure leaves a duplicate, never a lost crop."""
+        if self._has_face_reclassify():
+            return self.request(
+                "POST", f"/faces/{_seg(old_name)}/reclassify",
+                {"id": image_id, "new_name": new_name})
+        # v0.17 fallback: upload to new -> delete from old
+        bytes_ = self.fetch_media(f"faces/{_seg(old_name)}/{_seg(image_id)}")
+        self.face_register(new_name, bytes_, filename=image_id)
+        self.delete_faces(old_name, [image_id])
+        return {"ok": True, "via": "register+delete"}
 
 
 # ---- CLI (probe / smoke tests) ---------------------------------------------

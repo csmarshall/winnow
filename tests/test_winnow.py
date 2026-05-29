@@ -47,13 +47,13 @@ class TestDogDecide(unittest.TestCase):
     def d(self, build, coat, harness):
         return vlm.dog_decide({"build": build, "coat": coat, "harness": harness})
 
-    def test_brindle_stocky_is_luna(self):
+    def test_brindle_stocky_is_scooby(self):
         self.assertEqual(self.d("stocky", "brindle", False), "Scooby")
 
-    def test_black_lean_harness_is_frankie(self):
+    def test_black_lean_harness_is_scrappy(self):
         self.assertEqual(self.d("lean", "solid_black", True), "Scrappy")
 
-    def test_black_lean_no_harness_is_frankie(self):
+    def test_black_lean_no_harness_is_scrappy(self):
         self.assertEqual(self.d("lean", "solid_black", False), "Scrappy")
 
     def test_harness_outweighs_brindle(self):
@@ -186,23 +186,23 @@ class TestCommitPlan(unittest.TestCase):
         commit.REVIEW = self._orig
 
     def test_plan(self):
-        cands, categorize, face_classify, deletes, noop = commit.plan_actions()
-        cats = {c["cid"]: cat for c, cat in categorize}
+        p = commit.plan_actions()
+        cats = {c["cid"]: cat for c, cat, tf in p.categorize}   # (cand, category, file) triples
         self.assertEqual(cats["Scooby|Scooby|a"], "Scooby")          # positive -> identity
         self.assertEqual(cats["Scooby|Other dog|b"], "none")     # negative -> none
-        self.assertEqual(len(face_classify), 1)                # confirmed face -> assign
+        self.assertEqual(len(p.face_classify), 1)                # confirmed face -> assign
 
     def test_idempotent_skip_committed(self):
         self._write("committed.jsonl", [{"cid": "Scooby|Scooby|a"}])
-        _, categorize, _, _, _ = commit.plan_actions()
-        self.assertNotIn("Scooby|Scooby|a", {c["cid"] for c, _ in categorize})
+        p = commit.plan_actions()
+        self.assertNotIn("Scooby|Scooby|a", {c["cid"] for c, _, _ in p.categorize})
 
     def test_reject_face_goes_to_deletes(self):
         # ADR-0014: a face "reject" deletes it from the source (not categorize/noop)
         self._write("verdicts.jsonl", [{"cid": "face|Mario|tf", "verdict": "reject"}])
-        _, _, face_classify, deletes, _ = commit.plan_actions()
-        self.assertEqual([c["cid"] for c in deletes], ["face|Mario|tf"])
-        self.assertEqual(face_classify, [])
+        p = commit.plan_actions()
+        self.assertEqual([c["cid"] for c in p.deletes], ["face|Mario|tf"])
+        self.assertEqual(p.face_classify, [])
 
 
 class TestReviewApp(unittest.TestCase):
@@ -267,29 +267,40 @@ class TestBinarySweep(unittest.TestCase):
 
 
 class TestManualMultiClass(unittest.TestCase):
-    """Manual mode (option a, swipe-consistent): a multi-class model shows each crop
-    ONCE — in the pool of Frigate's guessed class ('Is this <guess>?') with the normal
-    swipe cross, NOT a choices/button dialog. Reassign (incl. 'none') corrects it.
-    A binary model keeps the lone yes/no pool. Regression for 'seeing the same image
-    multiple times' AND 'why is there a which-is-this dialog instead of swipe'."""
+    """Manual mode (ADR-0015, event-level): one card per EVENT, pooled by the best
+    crop's guess, with the normal swipe cross (no choices dialog). One event's many
+    near-identical crops collapse to a single card carrying the whole event + a capped
+    keep-set. Regression for 'same image keeps coming up' / 'which-is-this dialog'."""
 
     class _TrainFake(FakeClient):
         def __init__(self, files): self._files = files
         def list_train(self, model): return self._files
         def get_event(self, e): return {"camera": "back_yard"}
 
-    def test_multiclass_one_card_per_crop_in_guess_pool_no_choices(self):
+    def test_distinct_events_one_card_each_pooled_by_guess(self):
         files = ["1779.5-aa-1779.6-Scooby-0.9.webp", "1779.7-bb-1779.8-Scrappy-0.8.webp"]
         cfg = build_candidates.EXAMPLE_MODELS["Scooby"]          # multi-class dog
         out = build_candidates.from_model_manual(self._TrainFake(files), "Scooby", cfg)
-        self.assertEqual(len(out), 2)                            # ONE per crop, not per class
+        self.assertEqual(len(out), 2)                            # two events -> two cards
         by = {c["identity"]: c for c in out}
-        self.assertIn("Scooby", by); self.assertIn("Scrappy", by)   # pooled by Frigate's guess
-        self.assertEqual(by["Scooby"]["cid"], "Scooby|1779.5-aa-1779.6-Scooby-0.9.webp")
-        self.assertEqual(by["Scooby"]["confidence"], 0.9)           # score parsed from filename
+        self.assertIn("Scooby", by); self.assertIn("Scrappy", by)   # pooled by best-crop guess
+        self.assertEqual(by["Scooby"]["cid"], "Scooby|1779.5-aa")    # cid = model|event
+        self.assertEqual(by["Scooby"]["confidence"], 0.9)
         for rec in out:
             self.assertNotIn("choices", rec)                       # swipe cross, not a dialog
             self.assertNotIn("group", rec)
+
+    def test_one_event_many_crops_collapses_with_capped_keepset(self):
+        # 5 crops of ONE event -> ONE card; all carried, keep-set capped at default 3
+        files = [f"1779.0-zz-1779.{i}-Scooby-0.{i}.webp" for i in range(1, 6)]
+        cfg = build_candidates.EXAMPLE_MODELS["Scooby"]
+        out = build_candidates.from_model_manual(self._TrainFake(files), "Scooby", cfg)
+        self.assertEqual(len(out), 1)                            # one event -> one card
+        c = out[0]
+        self.assertEqual(len(c["event_files"]), 5)               # all crops carried
+        self.assertEqual(len(c["keep_files"]), 3)                # capped (WINNOW_KEEP_PER_EVENT=3)
+        self.assertEqual(len(c["keep_urls"]), 3)                 # lightbox filmstrip set
+        self.assertTrue(set(c["keep_files"]) <= set(c["event_files"]))
 
     def test_binary_single_yesno_pool(self):
         files = ["1779.5-aa-1779.6-Batmobile-0.9.webp"]
@@ -432,8 +443,8 @@ class TestReassign(unittest.TestCase):
                     "identity": "Scooby", "model": "Scooby", "training_file": "a"}) + "\n")
             with open(os.path.join(tmp, "verdicts.jsonl"), "w") as f:
                 f.write(json.dumps({"cid": "Scooby|Scooby|a", "verdict": "assign:Scrappy"}) + "\n")
-            _, categorize, _, _, _ = commit.plan_actions()
-            self.assertEqual([(c["model"], cat) for c, cat in categorize],
+            p = commit.plan_actions(); categorize = p.categorize
+            self.assertEqual([(c["model"], cat) for c, cat, tf in categorize],
                              [("Scooby", "Scrappy")])          # reassigned to Scrappy
         finally:
             commit.REVIEW = orig
@@ -446,7 +457,7 @@ class TestReassign(unittest.TestCase):
                     "identity": "Luigi", "face_train": "t.webp"}) + "\n")
             with open(os.path.join(tmp, "verdicts.jsonl"), "w") as f:
                 f.write(json.dumps({"cid": "face|Luigi|t", "verdict": "assign:Peach"}) + "\n")
-            _, _, face_classify, _, _ = commit.plan_actions()
+            p = commit.plan_actions(); face_classify = p.face_classify
             self.assertEqual([(c["cid"], name) for c, name in face_classify],
                              [("face|Luigi|t", "Peach")])  # re-named, not the guess
         finally:
@@ -491,6 +502,39 @@ class TestReassign(unittest.TestCase):
         self.assertEqual(rows[("dog", "Scrappy")]["yes"], 1)       # allocated in target
         self.assertEqual(rows[("dog", "Scrappy")]["pending"], 0)   # decided -> not re-reviewed
         self.assertEqual(review_app.queue("dog", "Scrappy"), [])    # not queued for review
+
+
+class TestEventLevelCommit(unittest.TestCase):
+    """ADR-0015: committing an event categorizes a capped diverse keep-set to the
+    decided class and PRUNES the rest from the train pool, in one atomic action."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(); self._orig = commit.REVIEW; commit.REVIEW = self.tmp
+    def tearDown(self): commit.REVIEW = self._orig
+    def _w(self, name, rows):
+        with open(os.path.join(self.tmp, name), "w") as f:
+            for r in rows: f.write(json.dumps(r) + "\n")
+
+    def test_yes_categorizes_keepset_prunes_rest(self):
+        ev = [f"1779.0-zz-1779.{i}-DeLorean-0.{i}.webp" for i in range(1, 6)]  # 5 crops, 1 event
+        keep = ev[:3]
+        self._w("candidates.jsonl", [{"cid": "Cars|1779.0-zz", "kind": "car",
+            "identity": "DeLorean", "model": "Cars", "training_file": ev[0],
+            "event_files": ev, "keep_files": keep}])
+        self._w("verdicts.jsonl", [{"cid": "Cars|1779.0-zz", "verdict": "yes"}])
+        p = commit.plan_actions(); categorize = p.categorize; train_deletes = p.train_deletes
+        self.assertEqual(sorted(tf for c, cat, tf in categorize), sorted(keep))   # keep-set categorized
+        self.assertTrue(all(cat == "DeLorean" for c, cat, tf in categorize))      # as the event's class
+        pruned = [f for c, files in train_deletes for f in files]
+        self.assertEqual(sorted(pruned), sorted(ev[3:]))                          # rest pruned
+
+    def test_reassign_categorizes_keepset_to_target(self):
+        ev = ["1779.0-zz-1779.1-DeLorean-0.9.webp", "1779.0-zz-1779.2-none-0.5.webp"]
+        self._w("candidates.jsonl", [{"cid": "Cars|1779.0-zz", "kind": "car",
+            "identity": "DeLorean", "model": "Cars", "training_file": ev[0],
+            "event_files": ev, "keep_files": ev}])
+        self._w("verdicts.jsonl", [{"cid": "Cars|1779.0-zz", "verdict": "assign:Batmobile"}])
+        p = commit.plan_actions(); categorize = p.categorize
+        self.assertTrue(categorize and all(cat == "Batmobile" for c, cat, tf in categorize))
 
 
 class TestQueuePayloadContract(unittest.TestCase):
@@ -554,6 +598,143 @@ class TestTargetsGeneration(unittest.TestCase):
         st = review_app.status()
         self.assertEqual(st["targets"]["person"], ["Luigi"])
         self.assertEqual(st["targets"]["dog"]["Scooby"], ["Scooby", "Scrappy"])
+
+
+class TestLibraryCuration(unittest.TestCase):
+    """ADR-0016: surface already-committed items (face library + classifier
+    datasets) for review, separately from daily train-pool work. Same swipe UI;
+    different APIs at commit time."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._b, self._c = build_candidates.REVIEW, commit.REVIEW
+        build_candidates.REVIEW = commit.REVIEW = self.tmp
+
+    def tearDown(self):
+        build_candidates.REVIEW = self._b
+        commit.REVIEW = self._c
+
+    def _w(self, name, rows):
+        with open(os.path.join(self.tmp, name), "w") as f:
+            for r in rows: f.write(json.dumps(r) + "\n")
+
+    def test_library_candidates_built_for_faces_and_datasets(self):
+        class C(FakeClient):
+            def list_train(self, m): return []
+            def list_faces(self):
+                return {"train": [], "Luigi": ["Luigi-1.webp", "Luigi-2.webp"],
+                        "Peach": ["Peach-1.webp"]}
+            def get_dataset(self, m):
+                return {"categories": {"Scooby": ["Scooby-1.png"], "Scrappy": [], "none": []}}
+        build_candidates.build(client=C(), manual=True)
+        cands = [json.loads(l) for l in open(os.path.join(self.tmp, "candidates.jsonl"))]
+        lib = [c for c in cands if c.get("bucket") == "library"]
+        # 3 face library + 1 dataset library = 4 (Batmobile/DeLorean have empty datasets)
+        self.assertGreaterEqual(len(lib), 4)
+        faces = {c["cid"]: c for c in lib if c["source"] == "library_face"}
+        self.assertIn("face_lib|Luigi|Luigi-1.webp", faces)
+        self.assertEqual(faces["face_lib|Luigi|Luigi-1.webp"]["kind"], "person")
+        ds = {c["cid"]: c for c in lib if c["source"] == "library_dataset"}
+        scooby = next(c for c in ds.values() if "Scooby-1.png" in c["cid"])
+        self.assertEqual(scooby["library_category"], "Scooby")
+        self.assertEqual(scooby["model"], "Scooby")
+
+    def test_library_review_disabled_via_env(self):
+        # Respect WINNOW_LIBRARY_REVIEW=0 (hide the cleanup section entirely).
+        orig = build_candidates.LIBRARY
+        build_candidates.LIBRARY = False
+        try:
+            class C(FakeClient):
+                def list_train(self, m): return []
+                def list_faces(self):
+                    return {"train": [], "Luigi": ["Luigi-1.webp"]}
+            build_candidates.build(client=C(), manual=True)
+            cands = [json.loads(l) for l in open(os.path.join(self.tmp, "candidates.jsonl"))]
+            self.assertEqual([c for c in cands if c.get("bucket") == "library"], [])
+        finally:
+            build_candidates.LIBRARY = orig
+
+    def test_commit_face_library_reject_calls_delete(self):
+        self._w("candidates.jsonl", [{
+            "cid": "face_lib|Mario|x.webp", "kind": "person", "identity": "Mario",
+            "bucket": "library", "source": "library_face",
+            "face_lib_name": "Mario", "library_id": "x.webp"}])
+        self._w("verdicts.jsonl", [{"cid": "face_lib|Mario|x.webp", "verdict": "reject"}])
+        p = commit.plan_actions()
+        self.assertEqual([c["cid"] for c in p.lib_face_dels], ["face_lib|Mario|x.webp"])
+        self.assertEqual(p.deletes, [])         # NOT routed to the train-pool deletes path
+
+    def test_commit_face_library_reassign_is_move(self):
+        # The Luigi -> Mario correction: assign:Luigi moves out of Mario
+        self._w("candidates.jsonl", [{
+            "cid": "face_lib|Mario|x.webp", "kind": "person", "identity": "Mario",
+            "bucket": "library", "source": "library_face",
+            "face_lib_name": "Mario", "library_id": "x.webp"}])
+        self._w("verdicts.jsonl", [{"cid": "face_lib|Mario|x.webp", "verdict": "assign:Luigi"}])
+        p = commit.plan_actions()
+        self.assertEqual(p.lib_face_moves, [(
+            {"cid": "face_lib|Mario|x.webp", "kind": "person", "identity": "Mario",
+             "bucket": "library", "source": "library_face",
+             "face_lib_name": "Mario", "library_id": "x.webp"}, "Luigi")])
+
+    def test_commit_dataset_library_reassign_uses_reclassify(self):
+        self._w("candidates.jsonl", [{
+            "cid": "Cars_lib|Batmobile|c.png", "kind": "car", "identity": "Batmobile",
+            "bucket": "library", "source": "library_dataset",
+            "model": "Cars", "library_category": "Batmobile", "library_id": "c.png"}])
+        self._w("verdicts.jsonl", [{"cid": "Cars_lib|Batmobile|c.png",
+                                    "verdict": "assign:DeLorean"}])
+        p = commit.plan_actions()
+        self.assertEqual(len(p.lib_data_moves), 1)
+        cand, target = p.lib_data_moves[0]
+        self.assertEqual((cand["model"], cand["library_category"], target),
+                         ("Cars", "Batmobile", "DeLorean"))
+
+    def test_library_yes_is_a_noop_not_a_categorize(self):
+        # "Yes" on a library item = "still correct"; no API call needed, just track
+        # the verdict so we don't ask again. Critically it must NOT fall through
+        # to the train-pool categorize path (which would crash with no training_file).
+        self._w("candidates.jsonl", [{
+            "cid": "Cars_lib|Batmobile|c.png", "kind": "car", "identity": "Batmobile",
+            "bucket": "library", "source": "library_dataset",
+            "model": "Cars", "library_category": "Batmobile", "library_id": "c.png"}])
+        self._w("verdicts.jsonl", [{"cid": "Cars_lib|Batmobile|c.png", "verdict": "yes"}])
+        p = commit.plan_actions()
+        self.assertEqual(p.categorize, [])
+        self.assertEqual(p.lib_data_moves, [])
+        self.assertEqual(p.lib_data_dels, [])
+        self.assertIn("Cars_lib|Batmobile|c.png", p.noop)
+
+
+class TestBucketSeparation(unittest.TestCase):
+    """A library candidate must NOT contaminate the daily-review pool counts,
+    and queue(kind, identity, bucket) must keep the two buckets distinct."""
+
+    def setUp(self):
+        review_app.FLAGGED_CIDS = set(); review_app.VERDICT = {}
+        review_app.CAND = {
+            "face|Charles|t1": {"cid": "face|Charles|t1", "kind": "person",
+                "identity": "Charles", "face_train": "t1.webp", "meta": {}, "img_url": "u",
+                "confidence": 0.9},
+            "face_lib|Charles|x.webp": {"cid": "face_lib|Charles|x.webp", "kind": "person",
+                "identity": "Charles", "bucket": "library", "source": "library_face",
+                "face_lib_name": "Charles", "library_id": "x.webp",
+                "meta": {}, "img_url": "u", "confidence": None},
+        }
+
+    def test_identities_returns_distinct_review_and_library_rows(self):
+        rows = {(r["kind"], r["identity"], r["bucket"]): r for r in review_app.identities()}
+        self.assertIn(("person", "Charles", "review"), rows)
+        self.assertIn(("person", "Charles", "library"), rows)
+        self.assertEqual(rows[("person", "Charles", "review")]["total"], 1)
+        self.assertEqual(rows[("person", "Charles", "library")]["total"], 1)
+
+    def test_queue_filters_by_bucket(self):
+        review_q = review_app.queue("person", "Charles", "review")
+        library_q = review_app.queue("person", "Charles", "library")
+        self.assertEqual([c["cid"] for c in review_q], ["face|Charles|t1"])
+        self.assertEqual([c["cid"] for c in library_q], ["face_lib|Charles|x.webp"])
+        self.assertEqual(library_q[0]["bucket"], "library")    # payload carries it
 
 
 class TestCommitGate(unittest.TestCase):

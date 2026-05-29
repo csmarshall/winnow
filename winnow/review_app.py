@@ -131,12 +131,17 @@ def _assigned_groups() -> set:
 
 
 def identities() -> list[dict]:
+    """Aggregate pool counts per (kind, identity, bucket). Two buckets exist:
+    'review' (the daily train-pool work) and 'library' (already-committed
+    cleanup, ADR-0016). The same identity can appear in both — they're
+    distinct pools with distinct verdicts."""
     agg: dict[tuple, dict] = {}
     assigned = _assigned_groups()
 
-    def _row(kind, ident):
-        return agg.setdefault((kind, ident), {"kind": kind, "identity": ident,
-                              "total": 0, "yes": 0, "no": 0, "skip": 0, "moved": 0})
+    def _row(kind, ident, bucket):
+        return agg.setdefault((kind, ident, bucket),
+                              {"kind": kind, "identity": ident, "bucket": bucket,
+                               "total": 0, "yes": 0, "no": 0, "skip": 0, "moved": 0})
 
     for c in CAND.values():
         if c["cid"] in FLAGGED_CIDS:
@@ -144,7 +149,8 @@ def identities() -> list[dict]:
         v = VERDICT.get(c["cid"])
         if v is None and c.get("group") in assigned:
             continue  # claimed by another pool — not part of this pool's work
-        a = _row(c["kind"], c["identity"])
+        bucket = c.get("bucket") or "review"
+        a = _row(c["kind"], c["identity"], bucket)
         a["total"] += 1
         if v is None:
             pass
@@ -156,7 +162,7 @@ def identities() -> list[dict]:
             a["moved"] += 1        # reassigned OUT of this (source/guess) pool
             target = v[len("assign:"):]
             if target != c["identity"]:   # reshuffle: ALLOCATED + decided in the target pool
-                t = _row(c["kind"], target)
+                t = _row(c["kind"], target, bucket)
                 t["total"] += 1
                 t["yes"] += 1
         else:                      # "yes" (or, in N-way mode, a chosen subtype)
@@ -164,7 +170,8 @@ def identities() -> list[dict]:
     rows = list(agg.values())
     for a in rows:
         a["pending"] = a["total"] - a["yes"] - a["no"] - a["skip"] - a["moved"]
-    rows.sort(key=lambda a: (KIND_ORDER.get(a["kind"], 9), a["identity"]))
+    rows.sort(key=lambda a: (a["bucket"] != "review",     # review first, library after
+                             KIND_ORDER.get(a["kind"], 9), a["identity"]))
     return rows
 
 
@@ -206,22 +213,29 @@ def status() -> dict:
     }
 
 
-def queue(kind: str, identity: str) -> list[dict]:
+def queue(kind: str, identity: str, bucket: str = "review") -> list[dict]:
+    """Build the swipe queue for one pool. `bucket` is "review" (train-pool /
+    daily) or "library" (already-committed cleanup, ADR-0016). The same
+    (kind, identity) can exist in both — they don't share candidates."""
     out = []
     assigned = _assigned_groups()
     for c in CAND.values():
-        if c["kind"] == kind and c["identity"] == identity and c["cid"] not in VERDICT:
+        cand_bucket = c.get("bucket") or "review"
+        if (c["kind"] == kind and c["identity"] == identity
+                and cand_bucket == bucket and c["cid"] not in VERDICT):
             if c.get("group") in assigned or c["cid"] in FLAGGED_CIDS:
                 continue  # confirmed elsewhere, or flagged (auto-hidden)
             out.append({"cid": c["cid"], "confidence": c["confidence"],
                         "kind": c["kind"], "identity": c["identity"],
+                        "bucket": cand_bucket,     # "review" or "library" (ADR-0016)
                         "model": c.get("model"),   # client needs these for the "?" picker
                         "unidentified": c.get("unidentified", False),  # face with no guess
                         "reason": c.get("reason", ""), "meta": c.get("meta", {}),
                         "source": c.get("source", ""), "question": c.get("question"),
                         "img_url": c.get("img_url"), "full_url": c.get("full_url"),
                         "full_url_alt": c.get("full_url_alt"), "clip_url": c.get("clip_url"),
-                        "box": c.get("box"), "choices": c.get("choices")})
+                        "box": c.get("box"), "choices": c.get("choices"),
+                        "keep_urls": c.get("keep_urls")})   # event keep-set (lightbox filmstrip)
     out.sort(key=lambda c: (c["confidence"] is None, c["confidence"] or 0))
     return out
 
@@ -275,14 +289,22 @@ def trigger_refresh() -> bool:
     return True
 
 
-def _do_commit():
+def _do_commit(retrain: bool = True):
+    """Run a commit in the background. `retrain` (default True) controls whether
+    the adapter triggers a model retrain after the push. UI sends retrain=False
+    for bulk library-cleanup sessions (ADR-0016) so dozens of micro-corrections
+    don't kick off a retrain per batch."""
     if COMMIT_FN is None:
         return
     if not _commit_lock.acquire(blocking=False):
         return
     try:
         COMMIT["status"] = "running"
-        summary = COMMIT_FN() or "done"      # push verdicts to source + rebuild
+        # COMMIT_FN's signature was historically zero-arg; pass retrain only if it
+        # accepts it (back-compat with older adapters that don't support the toggle).
+        import inspect
+        kwargs = {"retrain": retrain} if "retrain" in inspect.signature(COMMIT_FN).parameters else {}
+        summary = COMMIT_FN(**kwargs) or "done"   # push verdicts to source + rebuild
         load()                               # committed items drop out, leftovers stay
         now = time.time()
         COMMIT.update(status="idle", last=now, summary=str(summary))
@@ -296,11 +318,14 @@ def _do_commit():
         _commit_lock.release()
 
 
-def trigger_commit() -> bool:
-    """User-triggered: push accumulated verdicts to the source, then rebuild."""
+def trigger_commit(retrain: bool = True) -> bool:
+    """User-triggered: push accumulated verdicts to the source, then rebuild.
+    `retrain` (default True per ADR-0013 / consistency with normal commit) can
+    be False for bulk library-cleanup sessions where you don't want a retrain
+    after every micro-batch (ADR-0016)."""
     if COMMIT_FN is None or COMMIT["status"] == "running":
         return False
-    threading.Thread(target=_do_commit, daemon=True).start()
+    threading.Thread(target=_do_commit, args=(retrain,), daemon=True).start()
     return True
 
 
@@ -341,6 +366,9 @@ PAGE = r"""<!doctype html><meta charset=utf-8>
    text-decoration:underline;cursor:pointer}
  .commitnote{margin:8px 0;padding:9px 12px;border-radius:9px;background:#15212e;
    border:1px solid #2c4a63;color:#bcd;font-size:13px;line-height:1.45}
+ /* library-cleanup section header (ADR-0016) — visually distinct from daily review */
+ .libhead{margin:32px 0 4px;padding-top:18px;border-top:1px dashed #2a2a32}
+ .libhead h2{margin:0;color:#dbb} .libsub{color:#888;font-size:13px;margin:4px 0 10px}
  .fresh{margin:26px 0 6px;padding:14px;border-top:1px solid #2a2a2e;color:#aaa;
    font-size:14px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
  #swipe{display:none;text-align:center}
@@ -401,6 +429,11 @@ PAGE = r"""<!doctype html><meta charset=utf-8>
  .prog{color:#aaa;font-size:14px;margin-bottom:8px}
  .empty{padding:50px 0;color:#7c7;font-size:18px}
  .zoomhint{color:#666;font-size:12px;margin-top:6px}
+ /* event keep-set filmstrip in the lightbox: the exact crops that will be trained */
+ .keepstrip{margin-top:10px;max-width:96vw}
+ .keeplbl{color:#bcd;font-size:13px;margin-bottom:6px;text-align:center}
+ .keepthumbs{display:flex;gap:6px;overflow-x:auto;justify-content:center;padding-bottom:4px}
+ .keepthumbs img{height:72px;width:auto;border-radius:6px;border:2px solid #2a7a4a;background:#000}
  /* lightbox: full frame / scrubbable clip, with an unmissable close */
  #lb{position:fixed;inset:0;background:#000e;z-index:100;display:none;
    flex-direction:column;align-items:center;justify-content:center}
@@ -490,10 +523,15 @@ async function home(){
   document.getElementById('back').style.display='none';
   const st=await (await fetch('/api/status')).json();
   BUILD=st.build_id; TARGETS=st.targets||{}; window._src=st.source_name||'the backend';
-  const ids=st.identities, groups={};
-  ids.forEach(r=>{(groups[r.kind]=groups[r.kind]||[]).push(r)});
+  // Bucket split (ADR-0016): "review" = daily train-pool work; "library" =
+  // already-committed cleanup. Pools are distinct per bucket so the same
+  // identity (e.g. Charles) can have both a review row and a library row.
+  const review=st.identities.filter(r=>(r.bucket||'review')==='review');
+  const library=st.identities.filter(r=>r.bucket==='library');
+  const reviewPending=review.reduce((s,r)=>s+r.pending,0);
+  const libraryTotal=library.reduce((s,r)=>s+r.total,0);
   const lbl={person:'People',dog:'Dogs',car:'Cars'};
-  let h=`<div class=summary>Here are <b>${st.n_pools}</b> pool${st.n_pools==1?'':'s'} to review across <b>${st.n_types}</b> type${st.n_types==1?'':'s'} — ${st.total_pending} left.</div>`;
+  let h=`<div class=summary>Here are <b>${st.n_pools}</b> pool${st.n_pools==1?'':'s'} to review across <b>${st.n_types}</b> type${st.n_types==1?'':'s'} — ${reviewPending} left.</div>`;
   h+=`<div class=legend>🟩 match · 🟨 skipped / reassigned · 🟥 not a match · ▫ left to do</div>`;
   h+=commitHTML(st);   // user-triggered commit (ADR-0013) — pools stay local until you push
   // resume where you left off — only if the cookie was set against THIS build
@@ -501,20 +539,34 @@ async function home(){
   const pos=getCookie();
   if(pos){try{const p=JSON.parse(pos);
     if(p.build!==BUILD){document.cookie=POS+"=;max-age=0;path=/";}
-    else{const r=ids.find(x=>x.kind==p.kind&&x.identity==p.identity);
-      if(r&&r.pending>0)h+=`<div class=resume onclick='open_(${JSON.stringify(p.kind)},${JSON.stringify(p.identity)})'>▶ Resume ${p.identity} (${r.pending} left)</div>`;}}catch(e){}}
-  for(const k of ['person','dog','car']){
-    if(!groups[k])continue;
-    h+=`<div class=group><h2>${lbl[k]||k}</h2><div class=cards>`;
-    for(const r of groups[k]){
-      const done=r.pending===0, w=t=>100*t/Math.max(1,r.total);
-      const ip=(r.skip||0)+(r.moved||0);   // in-between: skipped + reassigned
-      h+=`<div class="id ${done?'done':''}" onclick='open_(${JSON.stringify(r.kind)},${JSON.stringify(r.identity)})'>
-        <div class=n>${r.identity}</div>
-        <div class=c>${r.pending?r.pending+' left':'✓ done'} · ${r.yes}✓ ${r.no}✗${r.skip?' '+r.skip+'⤼':''}${r.moved?' '+r.moved+'🏷':''}</div>
-        <div class=bar><span style="width:${w(r.yes)}%;background:${C_YES}"></span><span style="width:${w(ip)}%;background:${Y_HUD}"></span><span style="width:${w(r.no)}%;background:${C_NO}"></span></div></div>`;
+    else{const r=st.identities.find(x=>x.kind==p.kind&&x.identity==p.identity&&(x.bucket||'review')==(p.bucket||'review'));
+      if(r&&r.pending>0)h+=`<div class=resume onclick='open_(${JSON.stringify(p.kind)},${JSON.stringify(p.identity)},${JSON.stringify(p.bucket||'review')})'>▶ Resume ${p.identity} (${r.pending} left)</div>`;}}catch(e){}}
+  // Section renderer: groups a bucket's rows by kind and writes the card grid.
+  const renderSection = (rows, bucket) => {
+    const groups={}; rows.forEach(r=>{(groups[r.kind]=groups[r.kind]||[]).push(r)});
+    let out='';
+    for(const k of ['person','dog','car']){
+      if(!groups[k])continue;
+      out+=`<div class=group><h2>${lbl[k]||k}</h2><div class=cards>`;
+      for(const r of groups[k]){
+        const done=r.pending===0, w=t=>100*t/Math.max(1,r.total);
+        const ip=(r.skip||0)+(r.moved||0);   // in-between: skipped + reassigned
+        out+=`<div class="id ${done?'done':''}" onclick='open_(${JSON.stringify(r.kind)},${JSON.stringify(r.identity)},${JSON.stringify(bucket)})'>
+          <div class=n>${r.identity}</div>
+          <div class=c>${r.pending?r.pending+' left':'✓ done'} · ${r.yes}✓ ${r.no}✗${r.skip?' '+r.skip+'⤼':''}${r.moved?' '+r.moved+'🏷':''}</div>
+          <div class=bar><span style="width:${w(r.yes)}%;background:${C_YES}"></span><span style="width:${w(ip)}%;background:${Y_HUD}"></span><span style="width:${w(r.no)}%;background:${C_NO}"></span></div></div>`;
+      }
+      out+='</div></div>';
     }
-    h+='</div></div>';
+    return out;
+  };
+  h+=renderSection(review, 'review');
+  // Library-cleanup section (ADR-0016): only show when there's actually anything
+  // to curate (otherwise it's noise on a clean install).
+  if(library.length){
+    h+=`<div class=libhead><h2>🧹 Library cleanup</h2>
+        <div class=libsub>Already-committed items — fix mistakes Frigate auto-committed (e.g. wrong-person face matches) without leaving Winnow. ${libraryTotal} item${libraryTotal==1?'':'s'} across ${library.length} pool${library.length==1?'':'s'}.</div></div>`;
+    h+=renderSection(library, 'library');
   }
   h+=freshHTML(st.refresh);
   document.getElementById('home').innerHTML=h;
@@ -564,8 +616,17 @@ function commitHTML(st){
 }
 async function doCommit(n){
   const src=(window._src||'the backend');
-  if(!confirm('Commit '+n+' decision'+(n==1?'':'s')+' to '+src+'? Reviewed items get pushed and the pools refresh.'))return;
-  await fetch('/api/commit',{method:'POST'});
+  // Retrain toggle (ADR-0016): default ON (consistent with normal commit).
+  // OFF is for bulk library-cleanup sessions where dozens of micro-corrections
+  // shouldn't kick off a retrain per batch — you trigger one at the end.
+  const retrain = confirm('Commit '+n+' decision'+(n==1?'':'s')+' to '+src+'?\n\n'
+    + 'OK = commit AND retrain models (default — consistent with daily review)\n'
+    + 'Cancel pops up a fix-only option for bulk library cleanup.');
+  if(!retrain){
+    if(!confirm('Commit '+n+' WITHOUT retraining? Useful for bulk library cleanup; retrain manually when done.'))return;
+  }
+  await fetch('/api/commit',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({retrain})});
   const tick=async()=>{const st=await (await fetch('/api/status')).json();
     if(st.commit.status==='running'){document.getElementById('home').innerHTML=
       `<div class=summary>⏳ Committing to ${st.source_name||'the backend'}…</div><div class=fresh>Pushing your decisions + retraining.</div>`;
@@ -573,9 +634,12 @@ async function doCommit(n){
   tick();
 }
 
-async function open_(kind,identity){
-  cur={kind,identity}; setCookie(JSON.stringify({kind,identity,build:BUILD}));
-  q=await (await fetch('/api/queue?kind='+encodeURIComponent(kind)+'&identity='+encodeURIComponent(identity))).json();
+async function open_(kind,identity,bucket){
+  bucket = bucket || 'review';
+  cur={kind,identity,bucket}; setCookie(JSON.stringify({kind,identity,bucket,build:BUILD}));
+  q=await (await fetch('/api/queue?kind='+encodeURIComponent(kind)
+      +'&identity='+encodeURIComponent(identity)
+      +'&bucket='+encodeURIComponent(bucket))).json();
   idx=0; hist=[];
   document.getElementById('home').style.display='none';
   document.getElementById('swipe').style.display='block';
@@ -673,10 +737,18 @@ function openLB(c){
   // dogs/cars -> Frigate's boxed snapshot. Falls back: exact -> best-frame -> crop.
   window._lbsrcs=[c.full_url,c.full_url_alt,c.img_url].filter((v,i,a)=>v&&a.indexOf(v)===i);
   window._lbi=0; window._lbcid=c.cid; window._lbalt=c.full_url_alt;
-  // #lbmedia holds ONLY the image — the media buttons go in #lbctl with the cross,
-  // so a tall image can't push them under the cross (the overlap bug).
+  // #lbmedia holds the full-scene image — and, for an EVENT card, a filmstrip of the
+  // exact crops that will be trained, so you can verify they're all the same entity
+  // before confirming (ADR-0015). The media buttons live in #lbctl with the cross.
+  let strip='';
+  if(c.keep_urls && c.keep_urls.length){
+    const k=c.keep_urls.length, noun=(c.kind==='person'?'person':c.kind);
+    strip='<div class=keepstrip><div class=keeplbl>✓ '+k+' frame'+(k>1?'s':'')
+      +' kept for training as <b>'+esc(c.identity)+'</b> — verify it’s the same '+noun+':</div>'
+      +'<div class=keepthumbs>'+c.keep_urls.map(u=>'<img src="'+u+'">').join('')+'</div></div>';
+  }
   document.getElementById('lbmedia').innerHTML=
-    '<div class=lbframe><img src="'+(window._lbsrcs[0]||'')+'" onerror="lbImgErr(this)"></div>';
+    '<div class=lbframe><img src="'+(window._lbsrcs[0]||'')+'" onerror="lbImgErr(this)"></div>'+strip;
   let media='';
   if(c.clip_url)media+='<button class=playclip onclick="playClip(event,\''+c.clip_url+'\')">▶ Play clip</button>';
   if(window._lbalt && window._lbalt!==c.full_url)   // faces: jump to the boxed best frame
@@ -878,7 +950,8 @@ class H(BaseHTTPRequestHandler):
             self._json(identities())
         elif u.path == "/api/queue":
             qs = parse_qs(u.query)
-            self._json(queue(qs.get("kind", [""])[0], qs.get("identity", [""])[0]))
+            self._json(queue(qs.get("kind", [""])[0], qs.get("identity", [""])[0],
+                             qs.get("bucket", ["review"])[0]))   # ADR-0016
         elif u.path == "/img":
             cid = parse_qs(u.query).get("cid", [""])[0]
             c = CAND.get(cid)
@@ -898,7 +971,10 @@ class H(BaseHTTPRequestHandler):
             self._json({"started": started, "status": REFRESH["status"]})
             return
         if u.path == "/api/commit":
-            started = trigger_commit()
+            n = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            retrain = bool(body.get("retrain", True))   # default ON (Charles's pick)
+            started = trigger_commit(retrain=retrain)
             self._json({"started": started, "status": COMMIT["status"]})
             return
         if u.path == "/api/flag":

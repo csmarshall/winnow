@@ -14,8 +14,10 @@ Then open **http://YOUR_HOST:8077** from any machine on the LAN.
 
 - `restart: unless-stopped` in `docker-compose.yml` brings the container back on
   boot (Docker starts at boot), so no init/service file is needed.
-- Set `FRIGATE_URL` in `docker-compose.yml` to your **browser-reachable** Frigate
-  address (LAN IP), not `127.0.0.1` — image URLs are embedded for the client.
+- Set your real values in `docker-compose.override.yml` (copy from
+  `docker-compose.override.yml.example`; gitignored — never edit the base file):
+  `FRIGATE_URL` must be your **browser-reachable** Frigate address (LAN IP), not
+  `127.0.0.1` — image URLs are embedded for the client.
 - Model config is **auto-discovered** from Frigate at refresh time (no names are
   hardcoded); add a dog/car classifier in Frigate and it shows up automatically.
 

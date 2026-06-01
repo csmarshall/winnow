@@ -31,3 +31,4 @@ Format: [`_template.md`](_template.md). Status ∈ Proposed | Accepted | Superse
 | [0014](0014-verdict-model-reassign-first-class.md) | Verdict model: reassign first-class, "no" is unresolved, reject deletes | Accepted |
 | [0015](0015-event-level-review-and-keepset.md) | Event-level review: one card per event, keep a capped diverse set, prune the rest | Accepted |
 | [0016](0016-library-curation.md) | Library curation: surface already-committed items for review (the "Luigi → Mario" gap) | Accepted |
+| [0017](0017-rescan-recordings.md) | Rescan recordings: human-confirmed re-recognition harvests face data from existing video | Accepted |

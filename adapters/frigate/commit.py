@@ -32,7 +32,8 @@ from frigate_client import FrigateClient, FrigateError
 # buckets) don't break callers — refer to fields by name, not position.
 Plan = namedtuple("Plan", [
     "cands", "categorize", "face_classify", "deletes", "train_deletes",
-    "lib_face_moves", "lib_face_dels", "lib_data_moves", "lib_data_dels", "noop",
+    "lib_face_moves", "lib_face_dels", "lib_data_moves", "lib_data_dels",
+    "rescan_registers", "noop",
 ])
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -98,6 +99,7 @@ def plan_actions():
     # Different APIs from the train-pool path: face library uses face_reclassify
     # (one-shot or register+delete) + delete_faces; dataset library uses
     # reclassify (in-model move) + delete_dataset_images.
+    rescan_registers: list = []    # (cand, target_name) — face_register the event snapshot
     lib_face_moves: list = []      # (cand, new_name)
     lib_face_dels: list = []       # cand
     lib_data_moves: list = []      # (cand, new_category)
@@ -120,6 +122,17 @@ def plan_actions():
                 lib_face_moves.append((c, target))
             else:
                 noop.append(cid)         # yes/no/skip/self-assign = just a confirmation
+            continue
+        # ---- RESCAN (ADR-0017): yes/reassign -> face_register the event snapshot ----
+        if c.get("source") == "rescan":
+            if verdict == "reject":
+                noop.append(cid)             # rejected = don't add to library; just drop
+            elif verdict == "yes":
+                rescan_registers.append((c, c["rescan_name"]))   # confirm Frigate's guess
+            elif target is not None and target != c["identity"]:
+                rescan_registers.append((c, target))             # reassign to actual person
+            else:
+                noop.append(cid)             # skip / self-assign / unknown
             continue
         if c.get("source") == "library_dataset":
             if verdict == "reject":
@@ -171,7 +184,7 @@ def plan_actions():
                 deletes=deletes, train_deletes=train_deletes,
                 lib_face_moves=lib_face_moves, lib_face_dels=lib_face_dels,
                 lib_data_moves=lib_data_moves, lib_data_dels=lib_data_dels,
-                noop=noop)
+                rescan_registers=rescan_registers, noop=noop)
 
 
 def run(apply=False, do_train=True, client=None):
@@ -180,13 +193,15 @@ def run(apply=False, do_train=True, client=None):
     deletes = p.deletes; train_deletes = p.train_deletes
     lib_face_moves = p.lib_face_moves; lib_face_dels = p.lib_face_dels
     lib_data_moves = p.lib_data_moves; lib_data_dels = p.lib_data_dels
+    rescan_registers = p.rescan_registers
     noop = p.noop
     n_tdel_planned = sum(len(files) for _, files in train_deletes)
     n_lib = (len(lib_face_moves) + len(lib_face_dels) + len(lib_data_moves) + len(lib_data_dels))
     print(f"plan: {len(categorize)} categorize, {len(face_classify)} face-assign, "
           f"{len(deletes)} face-delete, {n_tdel_planned} redundant-frame delete, "
           f"{n_lib} library cleanup ({len(lib_face_moves)+len(lib_data_moves)} reassign / "
-          f"{len(lib_face_dels)+len(lib_data_dels)} delete), {len(noop)} no-op")
+          f"{len(lib_face_dels)+len(lib_data_dels)} delete), "
+          f"{len(rescan_registers)} rescan-register, {len(noop)} no-op")
     for c, cat, tf in categorize[:8]:
         print(f"  categorize  {c['model']}/{cat:14} <- {tf[:40]}")
     if len(categorize) > 8:
@@ -200,7 +215,7 @@ def run(apply=False, do_train=True, client=None):
     if not apply:
         print("\n(dry run — re-run with --apply to execute)")
         return {"categorized": 0, "faces": 0, "deleted": 0, "train_deleted": 0,
-                "lib_reassigned": 0, "lib_deleted": 0, "trained": []}
+                "lib_reassigned": 0, "lib_deleted": 0, "rescan_registered": 0, "trained": []}
 
     c = client or FrigateClient()
     c.login()
@@ -210,7 +225,8 @@ def run(apply=False, do_train=True, client=None):
     from collections import defaultdict
     plan = defaultdict(lambda: {"cand": None, "cat": [], "tdel": [],
                                 "face": None, "delface": False,
-                                "lib_move": None, "lib_del": False})
+                                "lib_move": None, "lib_del": False,
+                                "rescan_target": None})
     for cand, cat, tf in categorize:
         plan[cand["cid"]]["cand"] = cand
         plan[cand["cid"]]["cat"].append((cat, tf))
@@ -230,10 +246,14 @@ def run(apply=False, do_train=True, client=None):
     for cand in lib_face_dels + lib_data_dels:
         plan[cand["cid"]]["cand"] = cand
         plan[cand["cid"]]["lib_del"] = True
+    # rescan (ADR-0017) — one face_register call per confirmed candidate
+    for cand, target in rescan_registers:
+        plan[cand["cid"]]["cand"] = cand
+        plan[cand["cid"]]["rescan_target"] = target
 
     done = open(os.path.join(REVIEW, "committed.jsonl"), "a")
     models = set()
-    n_cat = n_face = n_del = n_tdel = n_lib_move = n_lib_del = 0
+    n_cat = n_face = n_del = n_tdel = n_lib_move = n_lib_del = n_rescan = 0
     for cid, p in plan.items():
         cand, ok = p["cand"], True
         for cat, tf in p["cat"]:
@@ -280,6 +300,15 @@ def run(apply=False, do_train=True, client=None):
                 n_lib_del += 1
             except (FrigateError, Exception) as e:
                 print(f"  ! library delete failed {cid}: {e}"); ok = False
+        # ---- RESCAN register (ADR-0017): fetch event snapshot + face_register ----
+        if p["rescan_target"]:
+            try:
+                eid = cand["rescan_event_id"]
+                snap = c.fetch_event_snapshot(eid)
+                c.face_register(p["rescan_target"], snap, filename=f"{eid}.jpg")
+                n_rescan += 1
+            except (FrigateError, Exception) as e:
+                print(f"  ! rescan register failed {cid}: {e}"); ok = False
         if cand.get("model"):
             models.add(cand["model"])
         if ok:
@@ -299,9 +328,11 @@ def run(apply=False, do_train=True, client=None):
 
     print(f"\ncommitted: {n_cat} categorized, {n_face} faces assigned, {n_del} faces "
           f"deleted, {n_tdel} redundant frames pruned, {n_lib_move} library reassigned, "
-          f"{n_lib_del} library deleted, retrained {trained or 'nothing'}")
+          f"{n_lib_del} library deleted, {n_rescan} rescan-registered, "
+          f"retrained {trained or 'nothing'}")
     return {"categorized": n_cat, "faces": n_face, "deleted": n_del,
             "train_deleted": n_tdel, "lib_reassigned": n_lib_move,
+            "rescan_registered": n_rescan,
             "lib_deleted": n_lib_del, "trained": trained}
 
 

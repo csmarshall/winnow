@@ -282,24 +282,70 @@ class FrigateClient:
                 self._face_reclassify_cached = False
         return self._face_reclassify_cached
 
-    def face_register(self, name: str, file_bytes: bytes, filename: str = "face.webp"):
-        """Upload `file_bytes` directly into the `<name>` face library — Frigate
-        re-embeds and stores it. The v0.17 path used for Winnow's library
-        reassign (paired with delete_faces on the old name)."""
-        # Multipart form with `file=<bytes>`. urllib doesn't ship a multipart
-        # builder, so we hand-build the body (no extra dep).
-        boundary = "----winnowFaceUpload" + str(os.getpid())
+    def _multipart_upload(self, path: str, file_bytes: bytes, filename: str,
+                          content_type: str = "application/octet-stream"):
+        """POST `file_bytes` as a multipart form field 'file' to `path`. Returns
+        parsed JSON. urllib doesn't ship a multipart builder, so we hand-build
+        it (no extra dep). Used by face_register + face_recognize."""
+        boundary = "----winnowUpload" + str(os.getpid())
         body = (f"--{boundary}\r\n"
                 f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-                f"Content-Type: image/webp\r\n\r\n").encode()
+                f"Content-Type: {content_type}\r\n\r\n").encode()
         body += file_bytes + f"\r\n--{boundary}--\r\n".encode()
-        full = self._ensure_prefix() + f"/faces/{_seg(name)}/register"
+        full = self._ensure_prefix() + path
         req = urllib.request.Request(self.base + full, data=body, method="POST")
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
         if self._token:
             req.add_header("Authorization", f"Bearer {self._token}")
-        resp = self._opener.open(req, timeout=30)
+        resp = self._opener.open(req, timeout=60)
         return json.loads(resp.read().decode() or "null")
+
+    def face_register(self, name: str, file_bytes: bytes, filename: str = "face.webp"):
+        """Upload `file_bytes` directly into the `<name>` face library — Frigate
+        detects, aligns, embeds, and stores it. The v0.17 path used for Winnow's
+        library reassign (paired with delete_faces on the old name) and the
+        rescan-recordings tool (high-res frames -> high-quality library entries)."""
+        ct = ("image/webp" if filename.lower().endswith(".webp")
+              else "image/jpeg" if filename.lower().endswith((".jpg", ".jpeg"))
+              else "application/octet-stream")
+        return self._multipart_upload(f"/faces/{_seg(name)}/register", file_bytes, filename, ct)
+
+    def face_recognize(self, file_bytes: bytes, filename: str = "frame.jpg"):
+        """Run Frigate's face detection + recognition against the CURRENT
+        library on an uploaded image. Returns
+            {"success": True, "score": <float>, "face_name": <name>}
+        on a confident match, or {"success": False, "message": "..."} when
+        no face was detected / no match. Critical for the rescan tool: we use
+        the freshly-trimmed library as the authority, NOT old sub_labels
+        (which were assigned when the library was bloated and could be wrong)."""
+        ct = ("image/jpeg" if filename.lower().endswith((".jpg", ".jpeg"))
+              else "image/webp" if filename.lower().endswith(".webp")
+              else "application/octet-stream")
+        return self._multipart_upload("/faces/recognize", file_bytes, filename, ct)
+
+    def list_events(self, after: float | None = None, before: float | None = None,
+                    labels: str | None = None, sub_labels: str | None = None,
+                    has_snapshot: bool | None = None, limit: int = 1000):
+        """List Frigate events (people/objects detected by tracking). Used by the
+        rescan tool to walk recent person events for face harvesting."""
+        from urllib.parse import urlencode
+        q: dict = {"limit": int(limit)}
+        if after is not None: q["after"] = after
+        if before is not None: q["before"] = before
+        if labels: q["labels"] = labels
+        if sub_labels: q["sub_labels"] = sub_labels
+        if has_snapshot is not None: q["has_snapshot"] = 1 if has_snapshot else 0
+        return self.request("GET", "/events?" + urlencode(q))
+
+    def fetch_event_snapshot(self, event_id: str, timeout: int = 20) -> bytes:
+        """Download an event's snapshot as raw bytes — Frigate's already-picked
+        best frame for that tracked-object event (the face/object IS present)."""
+        prefix = self._ensure_prefix()
+        req = urllib.request.Request(
+            self.base + f"{prefix}/events/{_seg(event_id)}/snapshot.jpg")
+        if self._token:
+            req.add_header("Authorization", f"Bearer {self._token}")
+        return self._opener.open(req, timeout=timeout).read()
 
     def face_reclassify(self, old_name: str, image_id: str, new_name: str):
         """Move a face from <old_name>'s library to <new_name>'s. Adaptive:

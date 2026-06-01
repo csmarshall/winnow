@@ -235,7 +235,8 @@ def queue(kind: str, identity: str, bucket: str = "review") -> list[dict]:
                         "img_url": c.get("img_url"), "full_url": c.get("full_url"),
                         "full_url_alt": c.get("full_url_alt"), "clip_url": c.get("clip_url"),
                         "box": c.get("box"), "choices": c.get("choices"),
-                        "keep_urls": c.get("keep_urls")})   # event keep-set (lightbox filmstrip)
+                        "keep_urls": c.get("keep_urls"),   # event keep-set (lightbox filmstrip)
+                        "scene_urls": c.get("scene_urls")})   # library: per-camera scene fallbacks
     out.sort(key=lambda c: (c["confidence"] is None, c["confidence"] or 0))
     return out
 
@@ -441,6 +442,10 @@ PAGE = r"""<!doctype html><meta charset=utf-8>
    justify-content:center;gap:14px;width:100%;padding:8px;box-sizing:border-box}
  #lbmedia video,#lbmedia img{max-width:96vw;max-height:78vh;width:auto;height:auto;
    object-fit:contain;border-radius:8px;background:#000}
+ /* For tiny library face crops (~40×54 px, the only image when no recording is
+    available), force a visible upscale so the reviewer can actually see what they're
+    judging. Pixelated to keep edges crisp — better than browser bilinear blur. */
+ #lbmedia img.tiny{min-height:60vh;image-rendering:pixelated;image-rendering:crisp-edges}
  #lbx{position:absolute;top:max(12px,env(safe-area-inset-top));
    right:max(12px,env(safe-area-inset-right));width:54px;height:54px;border-radius:50%;
    background:#fff;color:#000;font-size:30px;font-weight:800;line-height:54px;
@@ -528,8 +533,11 @@ async function home(){
   // identity (e.g. Charles) can have both a review row and a library row.
   const review=st.identities.filter(r=>(r.bucket||'review')==='review');
   const library=st.identities.filter(r=>r.bucket==='library');
+  const rescan=st.identities.filter(r=>r.bucket==='rescan');
   const reviewPending=review.reduce((s,r)=>s+r.pending,0);
   const libraryTotal=library.reduce((s,r)=>s+r.total,0);
+  const rescanTotal=rescan.reduce((s,r)=>s+r.total,0);
+  const rescanPending=rescan.reduce((s,r)=>s+r.pending,0);
   const lbl={person:'People',dog:'Dogs',car:'Cars'};
   let h=`<div class=summary>Here are <b>${st.n_pools}</b> pool${st.n_pools==1?'':'s'} to review across <b>${st.n_types}</b> type${st.n_types==1?'':'s'} — ${reviewPending} left.</div>`;
   h+=`<div class=legend>🟩 match · 🟨 skipped / reassigned · 🟥 not a match · ▫ left to do</div>`;
@@ -567,6 +575,14 @@ async function home(){
     h+=`<div class=libhead><h2>🧹 Library cleanup</h2>
         <div class=libsub>Already-committed items — fix mistakes Frigate auto-committed (e.g. wrong-person face matches) without leaving Winnow. ${libraryTotal} item${libraryTotal==1?'':'s'} across ${library.length} pool${library.length==1?'':'s'}.</div></div>`;
     h+=renderSection(library, 'library');
+  }
+  // Rescan section (ADR-0017): pending face-registers harvested from recent
+  // recordings by eval/rescan_recordings.py. Each is "Is this <recognized>?".
+  // Yes/Reassign registers the event snapshot into that person's library.
+  if(rescan.length){
+    h+=`<div class=libhead><h2>🔍 Rescan candidates</h2>
+        <div class=libsub>Recent events Frigate's <i>current</i> library recognized as someone — confirm each before it lands in the library. ${rescanPending} of ${rescanTotal} left across ${rescan.length} pool${rescan.length==1?'':'s'}.</div></div>`;
+    h+=renderSection(rescan, 'rescan');
   }
   h+=freshHTML(st.refresh);
   document.getElementById('home').innerHTML=h;
@@ -735,7 +751,12 @@ async function undo(){
 function openLB(c){
   // full scene: faces -> the EXACT face-capture frame (matches the crop, boxless);
   // dogs/cars -> Frigate's boxed snapshot. Falls back: exact -> best-frame -> crop.
-  window._lbsrcs=[c.full_url,c.full_url_alt,c.img_url].filter((v,i,a)=>v&&a.indexOf(v)===i);
+  // Fallback chain for the lightbox image (first 200 wins, last resort = the crop).
+  // scene_urls comes from library face candidates (per-camera recording snapshots at
+  // the face timestamp — we don't probe at build time, the browser figures out which
+  // camera has the frame via onerror progression). ADR-0016.
+  window._lbsrcs=[...(c.scene_urls||[]),c.full_url,c.full_url_alt,c.img_url]
+    .filter((v,i,a)=>v&&a.indexOf(v)===i);
   window._lbi=0; window._lbcid=c.cid; window._lbalt=c.full_url_alt;
   // #lbmedia holds the full-scene image — and, for an EVENT card, a filmstrip of the
   // exact crops that will be trained, so you can verify they're all the same entity
@@ -748,7 +769,10 @@ function openLB(c){
       +'<div class=keepthumbs>'+c.keep_urls.map(u=>'<img src="'+u+'">').join('')+'</div></div>';
   }
   document.getElementById('lbmedia').innerHTML=
-    '<div class=lbframe><img src="'+(window._lbsrcs[0]||'')+'" onerror="lbImgErr(this)"></div>'+strip;
+    // onload tags any image whose natural size is small (face-library crops are ~40×54)
+    // with .tiny so the CSS upscale kicks in. Bigger crops render at natural size.
+    '<div class=lbframe><img src="'+(window._lbsrcs[0]||'')+'" onerror="lbImgErr(this)"'
+      +' onload="if(this.naturalWidth<200||this.naturalHeight<200)this.classList.add(\'tiny\')"></div>'+strip;
   let media='';
   if(c.clip_url)media+='<button class=playclip onclick="playClip(event,\''+c.clip_url+'\')">▶ Play clip</button>';
   if(window._lbalt && window._lbalt!==c.full_url)   // faces: jump to the boxed best frame

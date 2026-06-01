@@ -706,6 +706,102 @@ class TestLibraryCuration(unittest.TestCase):
         self.assertIn("Cars_lib|Batmobile|c.png", p.noop)
 
 
+class TestRescan(unittest.TestCase):
+    """ADR-0017: rescan candidates flow through Winnow review before they get
+    face_registered into the library — protects against the trimmed library
+    over-attributing faces to one pose-dominant identity."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._b, self._c = build_candidates.REVIEW, commit.REVIEW
+        build_candidates.REVIEW = commit.REVIEW = self.tmp
+        # from_rescan reads from RESCAN_FILE (constant computed at import); patch it
+        self._orig_rescan_file = build_candidates.RESCAN_FILE
+        build_candidates.RESCAN_FILE = os.path.join(self.tmp, "rescan_candidates.jsonl")
+
+    def tearDown(self):
+        build_candidates.REVIEW = self._b
+        commit.REVIEW = self._c
+        build_candidates.RESCAN_FILE = self._orig_rescan_file
+
+    def _write_rescan(self, rows):
+        with open(build_candidates.RESCAN_FILE, "w") as f:
+            for r in rows: f.write(json.dumps(r) + "\n")
+
+    def _w(self, name, rows):
+        with open(os.path.join(self.tmp, name), "w") as f:
+            for r in rows: f.write(json.dumps(r) + "\n")
+
+    def test_rescan_emits_one_card_per_pending_event(self):
+        # Two confident matches, plus a disagreement (Frigate's old sub_label was
+        # 'Mario' but the trimmed library now says 'Luigi') — both should surface.
+        self._write_rescan([
+            {"event_id": "1779000000.111-aa", "camera": "back_yard",
+             "start_time": 1779000000.111, "end_time": 1779000010.0,
+             "recognized": "Luigi", "score": 0.97, "old_sub_label": None},
+            {"event_id": "1779000020.222-bb", "camera": "back_yard",
+             "start_time": 1779000020.222, "end_time": 1779000030.0,
+             "recognized": "Luigi", "score": 0.99, "old_sub_label": "Mario"},
+        ])
+        out = build_candidates.from_rescan(FakeClient())
+        self.assertEqual(len(out), 2)
+        c0 = out[0]
+        self.assertEqual(c0["kind"], "person")
+        self.assertEqual(c0["identity"], "Luigi")
+        self.assertEqual(c0["bucket"], "rescan")
+        self.assertEqual(c0["source"], "rescan")
+        self.assertEqual(c0["rescan_name"], "Luigi")
+        self.assertEqual(c0["rescan_event_id"], "1779000000.111-aa")
+        self.assertIn("/api/events/1779000000.111-aa/snapshot.jpg", c0["full_url"])
+        # the disagreement is surfaced in the reason line for the second
+        self.assertIn("disagrees", out[1]["reason"])
+
+    def test_rescan_skips_already_committed(self):
+        self._write_rescan([
+            {"event_id": "evt-1", "recognized": "Luigi", "score": 0.97,
+             "camera": "back_yard", "start_time": 1.0, "end_time": 2.0},
+        ])
+        # commit's idempotency log marks rescan|Luigi|evt-1 as done
+        self._w("committed.jsonl", [{"cid": "rescan|Luigi|evt-1", "ts": 1.0}])
+        self.assertEqual(build_candidates.from_rescan(FakeClient()), [])
+
+    def test_commit_yes_routes_to_rescan_register(self):
+        # Yes on a rescan candidate -> face_register the event snapshot to the
+        # recognized name. NOT through the categorize path (which assumes a model).
+        self._w("candidates.jsonl", [{
+            "cid": "rescan|Luigi|evt-1", "kind": "person", "identity": "Luigi",
+            "bucket": "rescan", "source": "rescan",
+            "rescan_event_id": "evt-1", "rescan_name": "Luigi"}])
+        self._w("verdicts.jsonl", [{"cid": "rescan|Luigi|evt-1", "verdict": "yes"}])
+        p = commit.plan_actions()
+        self.assertEqual(len(p.rescan_registers), 1)
+        cand, target = p.rescan_registers[0]
+        self.assertEqual((cand["rescan_event_id"], target), ("evt-1", "Luigi"))
+        self.assertEqual(p.categorize, [])     # critically, did NOT fall through
+        self.assertEqual(p.face_classify, [])
+
+    def test_commit_reassign_routes_to_correct_target(self):
+        # Library says Luigi, reviewer says no, actually Peach -> register to Peach.
+        self._w("candidates.jsonl", [{
+            "cid": "rescan|Luigi|evt-1", "kind": "person", "identity": "Luigi",
+            "bucket": "rescan", "source": "rescan",
+            "rescan_event_id": "evt-1", "rescan_name": "Luigi"}])
+        self._w("verdicts.jsonl", [{"cid": "rescan|Luigi|evt-1", "verdict": "assign:Peach"}])
+        p = commit.plan_actions()
+        self.assertEqual([t for _, t in p.rescan_registers], ["Peach"])
+
+    def test_commit_reject_is_noop(self):
+        # Reject = "this isn't who Frigate thought" -> drop, don't register
+        self._w("candidates.jsonl", [{
+            "cid": "rescan|Luigi|evt-1", "kind": "person", "identity": "Luigi",
+            "bucket": "rescan", "source": "rescan",
+            "rescan_event_id": "evt-1", "rescan_name": "Luigi"}])
+        self._w("verdicts.jsonl", [{"cid": "rescan|Luigi|evt-1", "verdict": "reject"}])
+        p = commit.plan_actions()
+        self.assertEqual(p.rescan_registers, [])
+        self.assertIn("rescan|Luigi|evt-1", p.noop)
+
+
 class TestBucketSeparation(unittest.TestCase):
     """A library candidate must NOT contaminate the daily-review pool counts,
     and queue(kind, identity, bucket) must keep the two buckets distinct."""

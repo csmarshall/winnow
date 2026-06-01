@@ -367,6 +367,23 @@ LIBRARY = os.environ.get("WINNOW_LIBRARY_REVIEW", "1").lower() in ("1", "true", 
 LIBRARY_BUCKET = "library"
 
 
+_LIB_TS_RE = re.compile(r"(\d{9,}\.\d+)")   # unix-timestamp segment in a library filename
+_LIB_EVENT_RE = re.compile(r"(\d{9,}\.\d+)-([a-z0-9]+)")  # event id = ts-rand
+
+
+def _scene_urls_for_face_lib(client, filename: str) -> list[str]:
+    """Best-effort full-scene URLs for a face-library file. Face library names are
+    `<Name>-<unix_ts>.<ext>` (no event id, no camera) — so we try EACH known
+    camera's recording-frame at that timestamp; the first one that returns 200
+    wins via the browser's onerror fallback chain in the lightbox. We don't
+    probe at build time (would multiply HTTP load by 3× per face)."""
+    m = _LIB_TS_RE.search(filename)
+    if not m:
+        return []
+    ts = m.group(1)
+    return [client.recording_snapshot_url(cam, ts) for cam in _cameras(client) if cam]
+
+
 def from_face_library(client) -> list[dict]:
     """One candidate per file in each person's COMMITTED face folder
     (`/clips/faces/<Name>/<file>`), asking "Is this <Name>?". The library is
@@ -383,7 +400,7 @@ def from_face_library(client) -> list[dict]:
         if name in FACE_SKIP or not isinstance(files, list):
             continue
         for f in files:
-            out.append({
+            rec = {
                 "cid": f"face_lib|{name}|{f}",
                 "kind": "person", "identity": name,
                 "bucket": LIBRARY_BUCKET, "role": "positive",
@@ -393,7 +410,14 @@ def from_face_library(client) -> list[dict]:
                 "confidence": None,
                 "reason": f"Already in {name}'s library — verify",
                 "source": "library_face", "meta": {},
-            })
+            }
+            # Lightbox full-scene: try each camera's recording at the face_ts;
+            # browser-side onerror fallback picks the first that 200s, else
+            # falls back to the committed crop itself.
+            scene = _scene_urls_for_face_lib(client, f)
+            if scene:
+                rec["scene_urls"] = scene
+            out.append(rec)
     return out
 
 
@@ -402,7 +426,10 @@ def from_dataset_library(client, model: str, cfg: dict) -> list[dict]:
     dataset (`/clips/<model>/dataset/<category>/<file>`), asking
     "Is this <category>?". Reassign uses client.reclassify (in-model move),
     Reject uses client.delete_dataset_images. `none` is included so hard-
-    negatives can also be reviewed/corrected."""
+    negatives can also be reviewed/corrected. Dataset filenames embed the
+    Frigate event id (`<Category>-<ts>-<rand>.png`), so we can attach the event
+    snapshot + clip exactly like a train candidate — full scene + scrubbable
+    clip from the lightbox."""
     out: list[dict] = []
     try:
         ds = client.get_dataset(model) or {}
@@ -410,11 +437,12 @@ def from_dataset_library(client, model: str, cfg: dict) -> list[dict]:
     except Exception as e:
         print(f"  (skipping dataset library for {model}: {e})")
         return out
+    ts = "1" if SHOW_TIMESTAMP else "0"
     for cat, files in cats.items():
         if not isinstance(files, list):
             continue
         for f in files:
-            out.append({
+            rec = {
                 "cid": f"{model}_lib|{cat}|{f}",
                 "kind": cfg["kind"], "identity": cat,
                 "bucket": LIBRARY_BUCKET, "role": "positive",
@@ -424,7 +452,78 @@ def from_dataset_library(client, model: str, cfg: dict) -> list[dict]:
                 "confidence": None,
                 "reason": f"Already in {model}/{cat} — verify",
                 "source": "library_dataset", "meta": {},
-            })
+            }
+            m = _LIB_EVENT_RE.search(f)
+            if m:                                  # event id in the filename
+                eid = m.group(0)
+                rec["full_url"] = client.event_snapshot_url(eid) + f"?timestamp={ts}&bbox=1"
+                rec["clip_url"] = client.event_clip_url(eid)
+            out.append(rec)
+    return out
+
+
+RESCAN_BUCKET = "rescan"
+RESCAN_FILE = os.path.join(REVIEW, "rescan_candidates.jsonl")
+
+
+def from_rescan(client) -> list[dict]:
+    """One swipe card per pending rescan candidate (review/rescan_candidates.jsonl,
+    written by eval/rescan_recordings.py — ADR-0017). Asks "Is this <recognized>?"
+    with the event snapshot as the full scene. Yes -> face_register the snapshot
+    bytes into Frigate's library at the recognized name; Reassign -> register
+    into the chosen target instead; No / Reject -> just drop from the queue.
+
+    We DELIBERATELY surface every entry — even ones where Frigate's `recognize`
+    was confident — because aggregate over-attribution is real (a trimmed
+    pose-biased library can over-identify the most-frontal-trained person);
+    human-in-the-loop confirms each before it touches the library."""
+    if not os.path.exists(RESCAN_FILE):
+        return []
+    ts = "1" if SHOW_TIMESTAMP else "0"
+    # Skip events the user has already actioned on a prior pass (committed_cids
+    # is checked by review_app, but we also skip locally if we can read it so
+    # the candidates file shrinks over time as it gets consumed).
+    committed_cids: set = set()
+    cm = os.path.join(REVIEW, "committed.jsonl")
+    if os.path.exists(cm):
+        for ln in open(cm):
+            try:
+                committed_cids.add(json.loads(ln).get("cid"))
+            except Exception:
+                pass
+    out: list[dict] = []
+    for ln in open(RESCAN_FILE):
+        try:
+            r = json.loads(ln)
+        except Exception:
+            continue
+        eid = r.get("event_id"); name = r.get("recognized")
+        if not eid or not name:
+            continue
+        cid = f"rescan|{name}|{eid}"
+        if cid in committed_cids:
+            continue
+        reason_bits = [f"Frigate recognized as {name} ({float(r.get('score') or 0):.2f})"]
+        old = r.get("old_sub_label")
+        if old and old != name:
+            reason_bits.append(f"was '{old}' before the trim — disagrees")
+        rec = {
+            "cid": cid,
+            "kind": "person", "identity": name,
+            "bucket": RESCAN_BUCKET, "role": "positive",
+            "rescan_event_id": eid, "rescan_name": name,   # commit needs both
+            # `img` is the event snapshot served by Frigate at full event-best-frame res
+            "img_url": client.event_snapshot_url(eid) + f"?timestamp={ts}&bbox=1",
+            "full_url": client.event_snapshot_url(eid) + f"?timestamp={ts}&bbox=1",
+            "clip_url": client.event_clip_url(eid),
+            "confidence": float(r.get("score") or 0),
+            "reason": " · ".join(reason_bits),
+            "source": "rescan", "meta": {
+                "event": eid, "camera": r.get("camera"),
+                "old_sub_label": old,
+            },
+        }
+        out.append(rec)
     return out
 
 
@@ -452,6 +551,9 @@ def build(client=None, manual=None) -> dict:
         cands += from_face_library(c)
         for model, cfg in models.items():
             cands += from_dataset_library(c, model, cfg)
+    # Rescan-recordings results (ADR-0017): each prior recognize hit becomes a
+    # swipe card. Empty when eval/rescan_recordings.py hasn't been run yet.
+    cands += from_rescan(c)
 
     os.makedirs(REVIEW, exist_ok=True)
     out = os.path.join(REVIEW, "candidates.jsonl")

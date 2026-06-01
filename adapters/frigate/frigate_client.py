@@ -347,6 +347,20 @@ class FrigateClient:
             req.add_header("Authorization", f"Bearer {self._token}")
         return self._opener.open(req, timeout=timeout).read()
 
+    def fetch_recording_snapshot(self, camera: str, frame_time: float,
+                                 timeout: int = 20) -> bytes:
+        """Download a record-resolution frame at the exact timestamp. Used by the
+        rescan-recordings tool to get a high-res source for the face crop —
+        recordings are ~4× the pixel area of the detect-stream event snapshot, so
+        a downstream PIL crop to the tracked-person box still gives the face
+        recognizer way more signal than the event snapshot would."""
+        prefix = self._ensure_prefix()
+        req = urllib.request.Request(
+            self.base + f"{prefix}/{_seg(camera)}/recordings/{frame_time}/snapshot.jpg")
+        if self._token:
+            req.add_header("Authorization", f"Bearer {self._token}")
+        return self._opener.open(req, timeout=timeout).read()
+
     def face_reclassify(self, old_name: str, image_id: str, new_name: str):
         """Move a face from <old_name>'s library to <new_name>'s. Adaptive:
         uses Frigate's one-shot /faces/{name}/reclassify when available

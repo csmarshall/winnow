@@ -732,16 +732,20 @@ class TestRescan(unittest.TestCase):
         with open(os.path.join(self.tmp, name), "w") as f:
             for r in rows: f.write(json.dumps(r) + "\n")
 
-    def test_rescan_emits_one_card_per_pending_event(self):
-        # Two confident matches, plus a disagreement (Frigate's old sub_label was
-        # 'Mario' but the trimmed library now says 'Luigi') — both should surface.
+    def test_rescan_emits_one_card_per_pending_event_with_v2_fields(self):
+        # v2: each candidate carries frame_ts + crop_path so the card shows the
+        # CROP as thumbnail and the RECORDING FRAME as the lightbox full scene.
         self._write_rescan([
             {"event_id": "1779000000.111-aa", "camera": "back_yard",
              "start_time": 1779000000.111, "end_time": 1779000010.0,
-             "recognized": "Luigi", "score": 0.97, "old_sub_label": None},
+             "frame_ts": 1779000005.0,
+             "recognized": "Luigi", "score": 0.97, "old_sub_label": None,
+             "crop_path": "/tmp/aa.jpg", "box": [0.1, 0.2, 0.3, 0.4]},
             {"event_id": "1779000020.222-bb", "camera": "back_yard",
              "start_time": 1779000020.222, "end_time": 1779000030.0,
-             "recognized": "Luigi", "score": 0.99, "old_sub_label": "Mario"},
+             "frame_ts": 1779000025.0,
+             "recognized": "Luigi", "score": 0.99, "old_sub_label": "Mario",
+             "crop_path": "/tmp/bb.jpg", "box": [0.1, 0.2, 0.3, 0.4]},
         ])
         out = build_candidates.from_rescan(FakeClient())
         self.assertEqual(len(out), 2)
@@ -752,9 +756,28 @@ class TestRescan(unittest.TestCase):
         self.assertEqual(c0["source"], "rescan")
         self.assertEqual(c0["rescan_name"], "Luigi")
         self.assertEqual(c0["rescan_event_id"], "1779000000.111-aa")
-        self.assertIn("/api/events/1779000000.111-aa/snapshot.jpg", c0["full_url"])
+        # v2 NEW: crop path carried for commit; img points to it
+        self.assertEqual(c0["rescan_crop_path"], "/tmp/aa.jpg")
+        self.assertEqual(c0["img"], "/tmp/aa.jpg")
+        # full_url is the RECORDING frame (high res, full context), not the event snapshot
+        self.assertIn("/api/back_yard/recordings/1779000005.0/snapshot.jpg", c0["full_url"])
+        # full_url_alt remains the bbox=1 event snapshot for the "show me the box" view
+        self.assertIn("/api/events/1779000000.111-aa/snapshot.jpg", c0["full_url_alt"])
         # the disagreement is surfaced in the reason line for the second
         self.assertIn("disagrees", out[1]["reason"])
+
+    def test_rescan_legacy_v1_candidate_still_works(self):
+        # v1 candidates lack frame_ts/crop_path — should fall back to event snapshot
+        # (back-compat for any rescan_candidates.jsonl rows written before v2).
+        self._write_rescan([
+            {"event_id": "1779000000.111-aa",
+             "recognized": "Luigi", "score": 0.97},
+        ])
+        out = build_candidates.from_rescan(FakeClient())
+        self.assertEqual(len(out), 1)
+        c = out[0]
+        self.assertIn("/api/events/1779000000.111-aa/snapshot.jpg", c["full_url"])
+        self.assertIsNone(c.get("rescan_crop_path"))
 
     def test_rescan_skips_already_committed(self):
         self._write_rescan([

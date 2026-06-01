@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.parse
 
 from frigate_client import FrigateClient
 from commit import _keep_subset   # the per-event keep-set selector (ADR-0015)
@@ -468,21 +469,22 @@ RESCAN_FILE = os.path.join(REVIEW, "rescan_candidates.jsonl")
 
 def from_rescan(client) -> list[dict]:
     """One swipe card per pending rescan candidate (review/rescan_candidates.jsonl,
-    written by eval/rescan_recordings.py — ADR-0017). Asks "Is this <recognized>?"
-    with the event snapshot as the full scene. Yes -> face_register the snapshot
-    bytes into Frigate's library at the recognized name; Reassign -> register
-    into the chosen target instead; No / Reject -> just drop from the queue.
+    written by eval/rescan_recordings.py — ADR-0017 v2). Asks "Is this <recognized>?".
 
-    We DELIBERATELY surface every entry — even ones where Frigate's `recognize`
-    was confident — because aggregate over-attribution is real (a trimmed
-    pose-biased library can over-identify the most-frontal-trained person);
-    human-in-the-loop confirms each before it touches the library."""
+    v2 (2026-06-01): each candidate references a CROP file (single-body, single-
+    face guarantee) plus the full record-res frame for lightbox context. The
+    swipe thumbnail (img_url -> /img?cid=...) shows the crop — that's the exact
+    image the recognize call saw and the exact bytes commit will face_register.
+    The lightbox additionally offers the full recording frame at the event's
+    midpoint so the human gets max context.
+
+    We DELIBERATELY surface every recognized candidate (no auto-confirm) —
+    aggregate over-attribution is real on a trimmed pose-biased library, so each
+    needs human eyes before it touches the library."""
     if not os.path.exists(RESCAN_FILE):
         return []
     ts = "1" if SHOW_TIMESTAMP else "0"
-    # Skip events the user has already actioned on a prior pass (committed_cids
-    # is checked by review_app, but we also skip locally if we can read it so
-    # the candidates file shrinks over time as it gets consumed).
+    # Skip events the user has already actioned on a prior pass.
     committed_cids: set = set()
     cm = os.path.join(REVIEW, "committed.jsonl")
     if os.path.exists(cm):
@@ -511,10 +513,19 @@ def from_rescan(client) -> list[dict]:
             "cid": cid,
             "kind": "person", "identity": name,
             "bucket": RESCAN_BUCKET, "role": "positive",
-            "rescan_event_id": eid, "rescan_name": name,   # commit needs both
-            # `img` is the event snapshot served by Frigate at full event-best-frame res
-            "img_url": client.event_snapshot_url(eid) + f"?timestamp={ts}&bbox=1",
-            "full_url": client.event_snapshot_url(eid) + f"?timestamp={ts}&bbox=1",
+            "rescan_event_id": eid, "rescan_name": name,
+            "rescan_crop_path": r.get("crop_path"),    # commit reads + registers these bytes
+            # `img` lets review_app serve the crop bytes from disk at /img?cid=...
+            "img": r.get("crop_path"),
+            "img_url": "/img?cid=" + urllib.parse.quote(cid, safe=""),
+            # full_url = full recording frame (high context for the human to verify
+            # the crop is the right person in scene). full_url_alt = event snapshot
+            # with bbox=1 (Frigate's curated best frame with the tracked-body box).
+            # Legacy v1 candidates have no frame_ts/camera -> just use the event snapshot.
+            "full_url": (client.recording_snapshot_url(r["camera"], r["frame_ts"])
+                         if (r.get("camera") and r.get("frame_ts") is not None)
+                         else client.event_snapshot_url(eid) + f"?timestamp={ts}&bbox=1"),
+            "full_url_alt": client.event_snapshot_url(eid) + f"?timestamp={ts}&bbox=1",
             "clip_url": client.event_clip_url(eid),
             "confidence": float(r.get("score") or 0),
             "reason": " · ".join(reason_bits),

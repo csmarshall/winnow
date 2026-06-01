@@ -300,12 +300,23 @@ def run(apply=False, do_train=True, client=None):
                 n_lib_del += 1
             except (FrigateError, Exception) as e:
                 print(f"  ! library delete failed {cid}: {e}"); ok = False
-        # ---- RESCAN register (ADR-0017): fetch event snapshot + face_register ----
+        # ---- RESCAN register (ADR-0017 v2): face_register the saved CROP bytes ----
+        # Crop bytes = single-body, single-face crop saved by rescan_recordings.py.
+        # What the human verified in the lightbox IS what trains. Legacy v1
+        # candidates (no rescan_crop_path) fall back to event-snapshot for
+        # backward compat with any rescan_candidates.jsonl rows written pre-v2.
         if p["rescan_target"]:
             try:
-                eid = cand["rescan_event_id"]
-                snap = c.fetch_event_snapshot(eid)
-                c.face_register(p["rescan_target"], snap, filename=f"{eid}.jpg")
+                cp = cand.get("rescan_crop_path")
+                if cp and os.path.exists(cp):
+                    with open(cp, "rb") as f:
+                        snap = f.read()
+                    filename = os.path.basename(cp)
+                else:
+                    eid = cand["rescan_event_id"]
+                    snap = c.fetch_event_snapshot(eid)
+                    filename = f"{eid}.jpg"
+                c.face_register(p["rescan_target"], snap, filename=filename)
                 n_rescan += 1
             except (FrigateError, Exception) as e:
                 print(f"  ! rescan register failed {cid}: {e}"); ok = False

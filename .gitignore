@@ -14,3 +14,6 @@ __pycache__/
 
 # Eval harness venv (dev-only; recreated from eval/README.md)
 eval/.venv/
+
+# Per-host session resume notes — point at out-of-repo session-state.md
+RESUME.md
